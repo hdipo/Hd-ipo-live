@@ -951,6 +951,132 @@ async function startServer() {
     res.sendFile(target);
   });
 
+  const findLocalBaseApk = (): string | null => {
+    const candidates = [
+      path.resolve(__dirname, 'dist', 'base.apk'),
+      path.resolve(__dirname, 'public', 'base.apk'),
+    ];
+    for (const p of candidates) {
+      if (fs.existsSync(p)) {
+        try {
+          const st = fs.statSync(p);
+          if (st.isFile() && st.size > 10000) return p;
+        } catch {
+          // ignore
+        }
+      }
+    }
+    return null;
+  };
+
+  const normalizeDirectApkUrl = (raw: string): string | null => {
+    const trimmed = String(raw || '').trim();
+    if (!/^https:\/\/.+/i.test(trimmed)) return null;
+    try {
+      const u = new URL(trimmed);
+      const host = u.hostname.toLowerCase();
+      if (
+        host === 'localhost' ||
+        host === '127.0.0.1' ||
+        host === '::1' ||
+        host.endsWith('.local') ||
+        /^10\./.test(host) ||
+        /^192\.168\./.test(host) ||
+        /^169\.254\./.test(host) ||
+        /^172\.(1[6-9]|2\d|3[01])\./.test(host)
+      ) {
+        return null;
+      }
+      // Auto-convert Google Drive share links to direct binary download URL
+      if (host === 'drive.google.com') {
+        const m1 = u.pathname.match(/\/file\/d\/([a-zA-Z0-9_-]+)/);
+        const fileId = (m1 && m1[1]) || u.searchParams.get('id');
+        if (fileId) {
+          return `https://drive.usercontent.google.com/download?id=${encodeURIComponent(fileId)}&export=download&confirm=t`;
+        }
+      }
+      // Auto-convert Dropbox preview links to direct binary download URL
+      if (host.endsWith('dropbox.com')) {
+        u.searchParams.set('dl', '1');
+        return u.toString();
+      }
+      return u.toString();
+    } catch {
+      return null;
+    }
+  };
+
+  app.get('/api/hdipo/apk-status', (_req, res) => {
+    const localApk = findLocalBaseApk();
+    if (localApk) {
+      const st = fs.statSync(localApk);
+      res.json({ ok: true, hasLocalApk: true, sizeBytes: st.size, fileName: 'base.apk' });
+      return;
+    }
+    res.json({ ok: true, hasLocalApk: false, sizeBytes: 0, fileName: 'base.apk' });
+  });
+
+  const handleBaseApkDownload = async (req: express.Request, res: express.Response) => {
+    const rawVer = typeof req.query.v === 'string' ? req.query.v.trim() : 'v1.0';
+    const safeVer = rawVer.replace(/[^a-zA-Z0-9._-]/g, '').slice(0, 24) || 'v1.0';
+    const downloadFileName = `HD-IPO-${safeVer}-base.apk`;
+
+    const localApk = findLocalBaseApk();
+    if (localApk) {
+      const st = fs.statSync(localApk);
+      res.setHeader('Content-Type', 'application/vnd.android.package-archive');
+      res.setHeader('Content-Disposition', `attachment; filename="${downloadFileName}"`);
+      res.setHeader('Content-Length', String(st.size));
+      res.setHeader('Cache-Control', 'no-store');
+      fs.createReadStream(localApk).pipe(res);
+      return;
+    }
+
+    const rawUrl = typeof req.query.url === 'string' ? req.query.url.trim() : '';
+    const directUrl = normalizeDirectApkUrl(rawUrl);
+    if (!directUrl) {
+      res.status(404).send('APK file abhi upload nahi hui hai. App Settings ya Chrome Install App use karein.');
+      return;
+    }
+
+    try {
+      const upstream = await fetch(directUrl, {
+        redirect: 'follow',
+        headers: { 'User-Agent': 'Mozilla/5.0 (Linux; Android 14) HD-IPO-Downloader/1.0' },
+      });
+      if (!upstream.ok || !upstream.body) {
+        res.redirect(302, directUrl);
+        return;
+      }
+
+      const contentType = String(upstream.headers.get('content-type') || '').toLowerCase();
+      if (contentType.includes('text/html')) {
+        // Upstream returned a confirmation/share HTML page rather than raw APK bytes — hand off to browser directly
+        res.redirect(302, directUrl);
+        return;
+      }
+
+      const buf = Buffer.from(await upstream.arrayBuffer());
+      // Verify standard APK/ZIP magic header (PK\x03\x04) so a corrupt HTML file is never saved as .apk
+      const isValidApkZip = buf.length > 4 && buf[0] === 0x50 && buf[1] === 0x4b && buf[2] === 0x03 && buf[3] === 0x04;
+      if (!isValidApkZip) {
+        res.redirect(302, directUrl);
+        return;
+      }
+
+      res.setHeader('Content-Type', 'application/vnd.android.package-archive');
+      res.setHeader('Content-Disposition', `attachment; filename="${downloadFileName}"`);
+      res.setHeader('Content-Length', String(buf.length));
+      res.setHeader('Cache-Control', 'no-store');
+      res.send(buf);
+    } catch {
+      res.redirect(302, directUrl);
+    }
+  };
+
+  app.get('/api/download/base.apk', handleBaseApkDownload);
+  app.get('/base.apk', handleBaseApkDownload);
+
   // Real-time 3-Year RHP Financials + Business Strength vs Market Demand Analysis for HD IPO
   app.get('/api/hdipo/financials', async (req, res) => {
     const name = typeof req.query.name === 'string' ? req.query.name.trim() : '';

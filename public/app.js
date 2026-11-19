@@ -1376,7 +1376,7 @@ function toggleSave(id) {
 let activeAnalysisIpoId = null;
 
 function hasAdvanceUnlocked() {
-  return Boolean(window.hdAuth && window.hdAuth.hasAdvanceAccess());
+  return true;
 }
 
 function applyFinancialsReportToIpo(ipo, finData) {
@@ -2016,13 +2016,60 @@ function getLocalAppVersion(remoteVersion) {
   return savedVer;
 }
 
-function startApkFileDownload(apkUrl) {
-  if (!apkUrl || !/^https:\/\//i.test(apkUrl)) return false;
+let serverLocalApkInfo = { hasLocalApk: false, sizeBytes: 0 };
+fetch("/api/hdipo/apk-status")
+  .then((r) => (r.ok ? r.json() : null))
+  .then((d) => {
+    if (d && d.hasLocalApk) {
+      serverLocalApkInfo = { hasLocalApk: true, sizeBytes: Number(d.sizeBytes || 0) };
+      if (currentPage === "home") renderIPOs();
+      refreshOpenDrawer();
+    }
+  })
+  .catch(() => {});
+
+const isInAppWebView = /whatsapp|fban|fbav|instagram|line\/|; wv\)/i.test(navigator.userAgent || "");
+
+function hasAnyApkAvailable(cfg) {
+  const c = cfg || getAppConfigSafe();
+  return Boolean(serverLocalApkInfo.hasLocalApk || (c.apkUrl && /^https:\/\//i.test(c.apkUrl)));
+}
+
+function getBaseApkDownloadUrl(cfg) {
+  const c = cfg || getAppConfigSafe();
+  const ver = encodeURIComponent(c.appVersion || "v1.0");
+  if (serverLocalApkInfo.hasLocalApk) {
+    return `/api/download/base.apk?v=${ver}`;
+  }
+  if (c.apkUrl && /^https:\/\//i.test(c.apkUrl)) {
+    return `/api/download/base.apk?url=${encodeURIComponent(c.apkUrl)}&v=${ver}`;
+  }
+  return "";
+}
+
+function getChromeIntentUrl() {
+  let origin = window.location.origin;
+  if (/^https:\/\/ais-dev-/i.test(origin)) {
+    origin = origin.replace(/^https:\/\/ais-dev-/i, "https://ais-pre-");
+  }
+  const hostPath = origin.replace(/^https?:\/\//i, "") + "/?install=1";
+  return `intent://${hostPath}#Intent;scheme=https;package=com.android.chrome;end`;
+}
+
+function startApkFileDownload(apkUrl, versionLabel) {
+  const cfg = getAppConfigSafe();
+  const ver = String(versionLabel || cfg.appVersion || "v1.0").replace(/[^a-zA-Z0-9._-]/g, "") || "v1.0";
+  const dlUrl = serverLocalApkInfo.hasLocalApk
+    ? `/api/download/base.apk?v=${encodeURIComponent(ver)}`
+    : (apkUrl && /^https:\/\//i.test(apkUrl)
+      ? `/api/download/base.apk?url=${encodeURIComponent(apkUrl)}&v=${encodeURIComponent(ver)}`
+      : "");
+  if (!dlUrl) return false;
+
+  // Same-origin attachment download triggers immediate 1-click base.apk download on Android Chrome
   const a = document.createElement("a");
-  a.href = apkUrl;
-  a.setAttribute("download", "HD-IPO.apk");
-  a.target = "_blank";
-  a.rel = "noopener noreferrer";
+  a.href = dlUrl;
+  a.setAttribute("download", `HD-IPO-${ver}-base.apk`);
   document.body.appendChild(a);
   a.click();
   document.body.removeChild(a);
@@ -2031,18 +2078,34 @@ function startApkFileDownload(apkUrl) {
 
 function openInstallPopup() {
   const cfg = getAppConfigSafe();
-  const hasApk = Boolean(cfg.apkUrl && /^https:\/\//i.test(cfg.apkUrl));
+  const hasApk = hasAnyApkAvailable(cfg);
   const canNativeInstall = Boolean(deferredInstallPrompt);
   const versionLabel = cfg.appVersion || "v1.0";
+  const directBaseApkUrl = getBaseApkDownloadUrl(cfg);
+  const sizeMbText = serverLocalApkInfo.sizeBytes > 0
+    ? ` • ${(serverLocalApkInfo.sizeBytes / (1024 * 1024)).toFixed(1)} MB`
+    : "";
 
   if (!popupOverlay) {
     openInstallGuide();
     return;
   }
 
-  const primaryLabel = hasApk && (isAndroidDevice || !canNativeInstall)
-    ? `📲 Install Now (Download APK ${escapeHtml(versionLabel)})`
-    : "📲 Install Now";
+  const primaryLabel = hasApk
+    ? `⬇️ 1-Click Download base.apk (${escapeHtml(versionLabel)}${sizeMbText})`
+    : (canNativeInstall ? `📲 1-Tap Install App (${escapeHtml(versionLabel)})` : `📲 Install HD IPO App (${escapeHtml(versionLabel)})`);
+
+  const whatsappChromeHintHtml = (isAndroidDevice && isInAppWebView) ? `
+    <div class="hd-popup-status" style="margin-bottom:10px;background:#eff6ff;border-color:#bfdbfe;color:#1e3a8a;">
+      <b>📱 WhatsApp Browser Detect Hua!</b><br>
+      WhatsApp ke andar download block ho jata hai. 1-Click install/download ke liye pehle Chrome mein kholein:
+      <div style="margin-top:7px;">
+        <a href="${escapeHtml(getChromeIntentUrl())}" style="display:inline-block;background:#1d4ed8;color:#fff;padding:7px 12px;border-radius:8px;text-decoration:none;font-weight:800;font-size:12px;">
+          🌐 Open in Chrome (1-Click Download) →
+        </a>
+      </div>
+    </div>
+  ` : "";
 
   popupOverlay.innerHTML = `
     <div class="hd-popup-card">
@@ -2051,39 +2114,64 @@ function openInstallPopup() {
         <img src="/pwa-192x192.png" alt="HD IPO" class="hd-popup-icon">
         <div>
           <div class="hd-popup-badge">OFFICIAL MOBILE APP • ${escapeHtml(versionLabel)}</div>
-          <h3 class="hd-popup-title">HD IPO Live Install Karein</h3>
+          <h3 class="hd-popup-title">HD IPO Live Download Karein</h3>
         </div>
       </div>
 
       <p class="hd-popup-desc">
-        Apne phone par <b>HD IPO</b> install karein — bina browser ke fast full-screen experience aur live updates ke saath:
+        No Login • No OTP • 100% Free! Apne phone par <b>HD IPO (${escapeHtml(versionLabel)})</b> install karein:
       </p>
 
       <ul class="hd-popup-features">
-        <li>📈 <b>Live Mainboard & SME GMP</b> + Listing Gain Estimate</li>
-        <li>📊 <b>3–4 Saal ka Real Financial Data</b> (Company Strong vs Market Demand)</li>
+        <li>📈 <b>Live Mainboard & SME GMP</b> + Listing & Closing Price</li>
+        <li>📊 <b>3–4 Saal ka Real Financial Data</b> & Shareholder Quota Last Date</li>
         <li>👨‍👩‍👧‍👦 <b>1-Click Family PAN Allotment</b> Checker & Target/SL</li>
       </ul>
 
+      ${whatsappChromeHintHtml}
+
       <div id="installPopupStatus" class="hd-popup-status hidden"></div>
 
-      <button id="popupInstallNowBtn" class="hd-popup-btn-primary" onclick="handleDirectInstallNow()">
-        ${primaryLabel}
-      </button>
+      ${hasApk ? `
+        <a id="popupInstallNowBtn" href="${escapeHtml(directBaseApkUrl)}" download="HD-IPO-${escapeHtml(versionLabel)}-base.apk" class="hd-popup-btn-primary" style="display:block;text-align:center;text-decoration:none;" onclick="onBaseApkClicked()">
+          ${primaryLabel}
+        </a>
+      ` : `
+        <button id="popupInstallNowBtn" class="hd-popup-btn-primary" onclick="handleDirectInstallNow()">
+          ${primaryLabel}
+        </button>
+      `}
 
       ${hasApk && canNativeInstall ? `
         <button class="hd-popup-btn-blue" onclick="runNativeInstallPrompt()">
-          ⚡ 1-Tap Instant Web App Install (Bina APK Download)
+          ⚡ 1-Tap Instant Phone App Install (Bina APK File)
         </button>
       ` : ""}
 
       <div class="hd-popup-row">
-        <button class="hd-popup-btn-outline" onclick="openShareModal()">📤 Share App</button>
+        <button class="hd-popup-btn-outline" onclick="openShareModal()">📤 WhatsApp Share</button>
         <button class="hd-popup-btn-cancel" onclick="dismissInstallPopup()">✖️ Cancel</button>
       </div>
     </div>
   `;
   popupOverlay.classList.remove("hidden");
+}
+
+function onBaseApkClicked() {
+  const cfg = getAppConfigSafe();
+  const ver = cfg.appVersion || "v1.0";
+  const dlUrl = getBaseApkDownloadUrl(cfg);
+  try { localStorage.setItem(HD_VERSION_STORAGE_KEY, ver); } catch (_) {}
+  showNotice(`⬇️ HD-IPO-${ver}-base.apk download shuru ho gaya!`);
+  const statusEl = document.getElementById("installPopupStatus");
+  if (statusEl) {
+    statusEl.innerHTML = `
+      <b>✅ HD-IPO-${escapeHtml(ver)}-base.apk Download Shuru Ho Gaya!</b><br>
+      Download complete hone par notification / Downloads mein file par tap karein → <b>Install</b> dabayein.<br>
+      <a href="${escapeHtml(dlUrl)}" download="HD-IPO-${escapeHtml(ver)}-base.apk" style="color:#15803d;font-weight:800;text-decoration:underline;">Agar start na hua to yahan tap karein ↓</a>
+    `;
+    statusEl.classList.remove("hidden");
+  }
 }
 
 function dismissInstallPopup() {
@@ -2093,44 +2181,34 @@ function dismissInstallPopup() {
 
 async function handleDirectInstallNow() {
   const cfg = getAppConfigSafe();
-  const hasApk = Boolean(cfg.apkUrl && /^https:\/\//i.test(cfg.apkUrl));
+  const hasApk = hasAnyApkAvailable(cfg);
   const statusEl = document.getElementById("installPopupStatus");
 
-  // 1) If native 1-tap install is ready AND (not Android APK or no APK configured) -> trigger native install immediately!
-  if (deferredInstallPrompt && (!hasApk || !isAndroidDevice)) {
-    await runNativeInstallPrompt();
-    return;
-  }
-
-  // 2) If direct APK link is configured -> start APK download immediately on single click!
+  // 1) If base.apk is available -> start 1-click versioned base.apk download immediately!
   if (hasApk) {
-    startApkFileDownload(cfg.apkUrl);
-    try { localStorage.setItem(HD_VERSION_STORAGE_KEY, cfg.appVersion || "v1.0"); } catch (_) {}
-    showNotice("⬇️ HD IPO APK download shuru ho gaya! File par tap karke Install karein.");
-    if (statusEl) {
-      statusEl.innerHTML = `
-        <b>✅ APK Download Shuru Ho Gaya!</b><br>
-        Download complete hone par file par tap karein → <b>Install</b> dabayein.<br>
-        <a href="${escapeHtml(cfg.apkUrl)}" target="_blank" rel="noopener noreferrer" download style="color:#15803d;font-weight:800;text-decoration:underline;">Agar download na ho to yahan tap karein ↗</a>
-      `;
-      statusEl.classList.remove("hidden");
-    }
+    startApkFileDownload(cfg.apkUrl, cfg.appVersion);
+    onBaseApkClicked();
     return;
   }
 
-  // 3) If native 1-tap install prompt is ready (fallback) -> trigger native install
+  // 2) If native 1-tap Chrome/Android WebAPK install prompt is ready -> trigger immediately!
   if (deferredInstallPrompt) {
     await runNativeInstallPrompt();
     return;
   }
 
-  // 4) Otherwise show instant manual 2-step guide right inside the popup
-  const currentUrl = window.location.origin + "/?install=1";
+  // 3) Otherwise show instant Chrome/iOS 1-tap install helper right inside the popup
+  const shareUrl = getShareAppLink();
   if (statusEl) {
     if (isInIframe) {
       statusEl.innerHTML = `
         <b>1-Tap Install ke liye Full Browser mein kholein:</b><br>
-        <a href="${escapeHtml(currentUrl)}" target="_blank" rel="noopener noreferrer" style="display:inline-block;margin-top:6px;background:#1d4ed8;color:#fff;padding:6px 10px;border-radius:7px;text-decoration:none;font-weight:700;">🌐 Chrome / Safari mein Kholein ↗</a>
+        <a href="${escapeHtml(shareUrl)}" target="_blank" rel="noopener noreferrer" style="display:inline-block;margin-top:6px;background:#1d4ed8;color:#fff;padding:6px 10px;border-radius:7px;text-decoration:none;font-weight:700;">🌐 Chrome / Safari mein Kholein ↗</a>
+      `;
+    } else if (isAndroidDevice && isInAppWebView) {
+      statusEl.innerHTML = `
+        <b>WhatsApp Browser se Chrome mein kholein:</b><br>
+        <a href="${escapeHtml(getChromeIntentUrl())}" style="display:inline-block;margin-top:6px;background:#1d4ed8;color:#fff;padding:6px 10px;border-radius:7px;text-decoration:none;font-weight:700;">🌐 Open in Chrome ↗</a>
       `;
     } else if (isIosDevice) {
       statusEl.innerHTML = `<b>iPhone Install:</b> Safari mein niche <b>Share (↑)</b> dabayein → <b>"Add to Home Screen"</b> → <b>Add</b>.`;
@@ -2231,11 +2309,11 @@ function cancelUpdatePopup() {
 async function runAppUpdateNow(isPreview = false) {
   const cfg = getAppConfigSafe();
   const remoteVer = cfg.appVersion || "v1.0";
-  const hasApk = Boolean(cfg.apkUrl && /^https:\/\//i.test(cfg.apkUrl));
+  const hasApk = hasAnyApkAvailable(cfg);
   const statusEl = document.getElementById("updatePopupStatus");
 
   if (isPreview) {
-    showNotice("Preview Mode: Asli user par ye button naya APK download / App update shuru karega!");
+    showNotice("Preview Mode: Asli user par ye button naya base.apk download / App update shuru karega!");
     closePopupOverlay();
     return;
   }
@@ -2243,13 +2321,14 @@ async function runAppUpdateNow(isPreview = false) {
   try { localStorage.setItem(HD_VERSION_STORAGE_KEY, remoteVer); } catch (_) {}
 
   if (hasApk) {
-    startApkFileDownload(cfg.apkUrl);
-    showNotice(`⬇️ HD IPO ${remoteVer} download shuru ho gaya! File tap karke Update/Install karein.`);
+    const dlUrl = getBaseApkDownloadUrl(cfg);
+    startApkFileDownload(cfg.apkUrl, remoteVer);
+    showNotice(`⬇️ HD-IPO-${remoteVer}-base.apk download shuru ho gaya! File tap karke Update/Install karein.`);
     if (statusEl) {
       statusEl.innerHTML = `
-        <b>✅ Naya APK (${escapeHtml(remoteVer)}) Download Shuru Ho Gaya!</b><br>
+        <b>✅ Naya base.apk (${escapeHtml(remoteVer)}) Download Shuru Ho Gaya!</b><br>
         Download hone ke baad file par tap karke <b>Update / Install</b> karein.<br>
-        <a href="${escapeHtml(cfg.apkUrl)}" target="_blank" rel="noopener noreferrer" download style="color:#15803d;font-weight:800;text-decoration:underline;">Direct Download Link ↗</a>
+        <a href="${escapeHtml(dlUrl)}" download="HD-IPO-${escapeHtml(remoteVer)}-base.apk" style="color:#15803d;font-weight:800;text-decoration:underline;">Direct Download base.apk ↓</a>
       `;
       statusEl.classList.remove("hidden");
     }
@@ -2328,7 +2407,11 @@ function formatShortTime(ts) {
 }
 
 function getShareAppLink() {
-  return window.location.origin + "/?install=1";
+  let origin = window.location.origin;
+  if (/^https:\/\/ais-dev-/i.test(origin)) {
+    origin = origin.replace(/^https:\/\/ais-dev-/i, "https://ais-pre-");
+  }
+  return origin + "/?install=1";
 }
 
 function buildSharePromoMessage() {
@@ -2339,14 +2422,14 @@ function buildSharePromoMessage() {
     `🚀 *HD IPO Live (${ver}) — Free IPO GMP & Allotment App*`,
     ``,
     `Ab har IPO mein apply karne se pehle poora data ek jagah dekhein:`,
+    `✅ *No Login / No OTP — Seedha Link Kholo & Free Use Karo!*`,
     `✅ *Live Mainboard & SME IPO GMP* (Estimated Profit ke saath)`,
     `✅ *3–4 Saal ka Real Financial Data* (Revenue, Profit, Net Worth & Debt)`,
     `✅ *Company Strong hai ya Sirf Market Demand?* (Smart Data Score)`,
-    `✅ *1-Click Family PAN Allotment Checker* (Sabhi family members ek saath)`,
-    `✅ *Live Subscription, Listing Target & Stop-Loss Calculator*`,
-    `✅ *100% Free & Real-Time Updates!*`,
+    `✅ *Shareholder Quota IPOs & 1-Click Family PAN Allotment Checker*`,
+    `✅ *Live Subscription, Listing Price & Closing Price Updates*`,
     ``,
-    `📲 *Direct Install / Download Link:*`,
+    `📲 *Seedha Open / Download Link:*`,
     url
   ].join("\n");
 }
@@ -2452,193 +2535,8 @@ function resetOtpFlowToPhone() {
   openAuthModal(pendingReturnIpoId);
 }
 
-function openAuthModal(returnIpoId = null) {
-  if (returnIpoId) pendingReturnIpoId = String(returnIpoId);
-  const ha = window.hdAuth;
-  const isLogged = ha && ha.isLoggedIn();
-  const needsMobile = ha && ha.needsMobileRegistration();
-  const isPhone = ha && typeof ha.isPhoneUser === "function" && ha.isPhoneUser();
-  const profile = ha && ha.profile;
-  const isAdmin = ha && ha.isAdmin();
-
-  let bodyHtml = "";
-  if (!isLogged) {
-    const errHtml = otpLoginState.error
-      ? `<div class="otp-error-box">⚠️ ${escapeHtml(otpLoginState.error)}</div>`
-      : "";
-
-    if (otpLoginState.step === "otp" && otpLoginState.mobile) {
-      const m = otpLoginState.mobile;
-      const formattedMob = `+91 ${m.slice(0, 5)} ${m.slice(5)}`;
-      bodyHtml = `
-        <div class="section-card">
-          <div style="text-align:center;">
-            <div class="lock-badge">SMS OTP VERIFICATION</div>
-            <h3 style="font-size:16.5px;font-weight:800;margin-bottom:6px;">6-Digit OTP Enter Karein</h3>
-            <p class="about-text" style="margin-bottom:12px;">
-              OTP bheja gaya hai: <b>${escapeHtml(formattedMob)}</b>
-              <button type="button" class="otp-link-btn" onclick="resetOtpFlowToPhone()">Change</button>
-            </p>
-          </div>
-          ${errHtml}
-          <div class="form-field" style="margin-bottom:10px;">
-            <label>6-Digit SMS OTP</label>
-            <input
-              type="tel"
-              id="otpCodeInput"
-              class="otp-input-box"
-              placeholder="● ● ● ● ● ●"
-              maxlength="6"
-              inputmode="numeric"
-              autocomplete="one-time-code"
-              onkeydown="if(event.key==='Enter'){handleVerifyMobileOtp();}"
-            >
-          </div>
-          <button id="verifyOtpBtn" class="btn-primary-full" style="background:#15803d;margin-top:4px;" onclick="handleVerifyMobileOtp()">
-            ✅ Verify OTP & Login
-          </button>
-          <div class="otp-meta-row">
-            <span style="font-size:11.5px;color:#64748b;">SMS nahi aaya?</span>
-            <button
-              type="button"
-              id="otpResendBtn"
-              class="otp-link-btn"
-              ${otpLoginState.resendSec > 0 ? "disabled" : ""}
-              onclick="handleSendMobileOtp(true)"
-            >${otpLoginState.resendSec > 0 ? `Resend OTP (${otpLoginState.resendSec}s)` : "🔄 Resend OTP"}</button>
-          </div>
-        </div>
-      `;
-    } else {
-      bodyHtml = `
-        <div class="section-card">
-          <div style="text-align:center;">
-            <div class="lock-badge">FREE MOBILE OTP LOGIN</div>
-            <h3 style="font-size:16.5px;font-weight:800;margin-bottom:6px;">Seedha Mobile Number Se Login</h3>
-            <p class="about-text" style="margin-bottom:14px;">
-              Koi Google/AI Studio login nahi! Sirf apna <b>10-digit Mobile Number</b> daalein aur SMS OTP se turant <b>3–4 Saal ka RHP Data</b>, <b>HD Score</b> aur <b>Targets</b> free unlock karein.
-            </p>
-          </div>
-          ${errHtml}
-          <div class="form-field" style="margin-bottom:12px;">
-            <label>10-Digit Mobile Number</label>
-            <div class="phone-input-wrap">
-              <span class="phone-prefix">🇮🇳 +91</span>
-              <input
-                type="tel"
-                id="otpMobileInput"
-                value="${escapeHtml(otpLoginState.mobile || "")}"
-                placeholder="9876543210"
-                maxlength="10"
-                inputmode="numeric"
-                autocomplete="tel-national"
-                onkeydown="if(event.key==='Enter'){handleSendMobileOtp(false);}"
-              >
-            </div>
-          </div>
-          <button id="sendOtpBtn" class="google-btn" onclick="handleSendMobileOtp(false)">
-            📲 Send OTP
-          </button>
-          <p style="font-size:11px;color:#64748b;margin-top:8px;text-align:center;">
-            6-digit SMS OTP aayega — 10 seconds mein Free Unlock!
-          </p>
-        </div>
-        <div class="section-card">
-          <div class="section-heading">📤 Family & Doston ke saath Share Karein</div>
-          <p class="about-text" style="margin-bottom:10px;">Apne family members aur doston ko bhi HD IPO app link WhatsApp par share karein.</p>
-          <button class="btn-primary-full" style="background:#15803d;margin-top:0;" onclick="shareAppWithFriends()">📤 Share HD IPO App Link</button>
-        </div>
-        <div style="text-align:center;margin-top:10px;">
-          <button type="button" class="admin-subtle-link" onclick="handleAdminGoogleSignIn()">App Owner / Admin Login</button>
-        </div>
-      `;
-    }
-  } else if (needsMobile && !isAdmin) {
-    const defaultName = (profile && profile.name) || (ha.user && ha.user.displayName) || "";
-    const verifiedPhone10 = isPhone ? String(ha.user.phoneNumber || "").replace(/\D/g, "").slice(-10) : "";
-    bodyHtml = `
-      <div class="section-card" style="border:1.5px solid #3b82f6;">
-        <div class="section-heading">✅ Mobile Verified — Apna Naam Daalein</div>
-        <p class="about-text" style="margin-bottom:10px;">
-          ${verifiedPhone10
-            ? `Aapka Mobile Number <b>+91 ${escapeHtml(verifiedPhone10)}</b> OTP se verify ho gaya hai ✅. Bas apna naam daalein aur Advance Analysis unlock karein:`
-            : `Account verify ho gaya (<b>${escapeHtml(ha.user.email || "")}</b>). Advance IPO Analysis unlock karne ke liye apna Naam aur Mobile Number daalein:`}
-        </p>
-        <div class="form-field">
-          <label>Aapka Poora Naam</label>
-          <input type="text" id="regUserName" value="${escapeHtml(defaultName)}" placeholder="e.g. Rahul Sharma" maxlength="80" onkeydown="if(event.key==='Enter'){handleCompleteMobileProfile();}">
-        </div>
-        ${verifiedPhone10 ? `
-          <input type="hidden" id="regUserMobile" value="${escapeHtml(verifiedPhone10)}">
-        ` : `
-          <div class="form-field">
-            <label>10-Digit Mobile Number (+91)</label>
-            <input type="tel" id="regUserMobile" placeholder="e.g. 9876543210" maxlength="10" inputmode="numeric">
-          </div>
-        `}
-        <button id="saveProfileBtn" class="btn-primary-full" onclick="handleCompleteMobileProfile()">✅ Save & Unlock Advance Analysis</button>
-      </div>
-    `;
-  } else {
-    const pName = profile ? profile.name : (ha.user.displayName || "Admin");
-    const pMobile = profile && profile.mobile
-      ? `+91 ${profile.mobile}${isPhone ? " ✅" : ""}`
-      : (isPhone ? `${ha.user.phoneNumber} ✅` : "Not added yet");
-    const pEmail = String((ha.user && ha.user.email) || (profile && profile.email) || "").trim();
-    bodyHtml = `
-      <div class="section-card hero-decision">
-        <div class="section-heading">${isAdmin ? "👑 Owner / Admin Account" : "✅ Verified HD IPO Member"}</div>
-        <div class="kv-row"><span class="kv-label">Name</span><span class="kv-val">${escapeHtml(pName)}</span></div>
-        <div class="kv-row"><span class="kv-label">Mobile Number</span><span class="kv-val">${escapeHtml(pMobile)}</span></div>
-        ${pEmail ? `<div class="kv-row"><span class="kv-label">Email</span><span class="kv-val">${escapeHtml(pEmail)}</span></div>` : ""}
-        <div class="kv-row"><span class="kv-label">Advance Access</span><span class="kv-val" style="color:#15803d;">UNLOCKED ✅</span></div>
-        <div class="kv-row" style="border:none;"><span class="kv-label">IPOs Analyzed</span><span class="kv-val">${profile ? (profile.viewsCount || 0) : 0}</span></div>
-      </div>
-
-      ${needsMobile && isAdmin ? `
-        <div class="section-card">
-          <div class="section-heading">📱 Apna Mobile Number Add Karein (Optional)</div>
-          <div class="form-grid">
-            <div class="form-field"><input type="text" id="regUserName" value="${escapeHtml(pName)}" placeholder="Name"></div>
-            <div class="form-field"><input type="tel" id="regUserMobile" placeholder="10-digit Mobile" maxlength="10"></div>
-          </div>
-          <button id="saveProfileBtn" class="btn-primary-full" style="margin-top:0;" onclick="handleCompleteMobileProfile()">Save Mobile Profile</button>
-        </div>
-      ` : ""}
-
-      ${isAdmin ? `
-        <div class="section-card" style="background:#eff6ff;border:1.5px solid #3b82f6;">
-          <div class="section-heading">👑 Owner User Analytics Dashboard</div>
-          <p class="about-text" style="margin-bottom:8px;">Dekhein kitne logon ne app install/login kiya, unke Mobile Numbers, aur kaunse IPO check ho rahe hain.</p>
-          <button class="btn-primary-full" onclick="openAdminFromModal()">📊 Open Users Dashboard →</button>
-        </div>
-      ` : ""}
-
-      <div class="section-card">
-        <div class="section-heading">📤 Family & Doston ko Share Karein</div>
-        <button class="btn-primary-full" style="background:#15803d;margin-top:0;" onclick="shareAppWithFriends()">📤 Share HD IPO App Link</button>
-      </div>
-
-      <button class="btn-primary-full" style="background:#dc2626;" onclick="handleLogout()">Logout</button>
-    `;
-  }
-
-  analysisModal.innerHTML = `
-    <div class="modal-header">
-      <button class="back-btn" onclick="closeAnalysis()">← Back</button>
-      <div class="modal-title">${isLogged ? "👤 My Account" : "📱 Mobile OTP Login"}</div>
-      <span style="width:48px;"></span>
-    </div>
-    <div class="modal-body">${bodyHtml}</div>
-  `;
-  analysisModal.classList.remove("hidden");
-  analysisModal.scrollTop = 0;
-
-  setTimeout(() => {
-    const targetInput = document.getElementById(otpLoginState.step === "otp" ? "otpCodeInput" : "otpMobileInput")
-      || document.getElementById("regUserName");
-    if (targetInput && typeof targetInput.focus === "function") targetInput.focus();
-  }, 60);
+function openAuthModal() {
+  openShareModal();
 }
 
 function openAdminFromModal() {
@@ -2971,93 +2869,45 @@ const sideDrawer = document.getElementById("sideDrawer");
 
 function renderSideDrawer() {
   if (!sideDrawer) return;
-  const ha = window.hdAuth;
-  const isLogged = Boolean(ha && ha.isLoggedIn());
-  const isAdmin = Boolean(ha && ha.isAdmin());
-  const hasAdvance = Boolean(ha && ha.hasAdvanceAccess());
-  const profile = ha && ha.profile;
   const cfg = getAppConfigSafe();
   const hasApk = Boolean(cfg.apkUrl && /^https:\/\//i.test(cfg.apkUrl));
   const remoteVer = cfg.appVersion || "v1.0";
   const localVer = getLocalAppVersion(remoteVer);
   const hasUpdate = cfg.loaded && compareAppVersions(remoteVer, localVer) > 0;
 
-  const displayName = isLogged
-    ? (profile?.name || ha.user?.displayName || (isAdmin ? "App Owner" : "HD IPO Member"))
-    : "Guest Investor";
-  const subInfo = isLogged
-    ? (profile?.mobile ? `+91 ${profile.mobile}` : (ha.user?.email || "Verified Account"))
-    : "Login karke 3–4 Saal ka Financial Data unlock karein";
-  const photoUrl = isLogged && ha.user?.photoURL ? ha.user.photoURL : "";
-  const initials = displayName.trim().slice(0, 2).toUpperCase() || "HD";
-
   sideDrawer.innerHTML = `
     <div class="drawer-header">
       <button class="drawer-close-btn" onclick="closeSideDrawer()" aria-label="Close Menu">✕</button>
       <div class="drawer-profile-row">
-        <div class="drawer-avatar">
-          ${photoUrl ? `<img src="${escapeHtml(photoUrl)}" alt="${escapeHtml(displayName)}">` : escapeHtml(initials)}
-        </div>
+        <div class="drawer-avatar">HD</div>
         <div class="drawer-user-info">
-          <div class="drawer-user-name">${escapeHtml(displayName)}</div>
-          <div class="drawer-user-sub">${escapeHtml(subInfo)}</div>
-          ${isAdmin
-            ? `<span class="drawer-role-tag admin">👑 Owner / Admin</span>`
-            : (hasAdvance
-                ? `<span class="drawer-role-tag verified">✓ Advance Unlocked</span>`
-                : `<span class="drawer-role-tag guest">Basic Mode</span>`)}
+          <div class="drawer-user-name">HD IPO Live</div>
+          <div class="drawer-user-sub">No Login • No OTP • Sabke Liye Free</div>
+          <span class="drawer-role-tag verified">✓ Full Data Unlocked</span>
         </div>
       </div>
-      ${!isLogged ? `
-        <button class="drawer-login-cta" onclick="closeSideDrawer();openAuthModal()">
-          🔐 Free Mobile Login Karein →
-        </button>
-      ` : (!hasAdvance && !isAdmin ? `
-        <button class="drawer-login-cta" onclick="closeSideDrawer();openAuthModal()">
-          📱 Mobile Number Add Karein (Step 2) →
-        </button>
-      ` : "")}
+      <button class="drawer-login-cta" style="background:#16a34a;color:#ffffff;" onclick="closeSideDrawer();openShareModal()">
+        💬 WhatsApp par Share Karein →
+      </button>
     </div>
 
     <div class="drawer-body">
-      <div class="drawer-section-label">ACCOUNT & ACCESS</div>
-
-      <button class="drawer-item" onclick="closeSideDrawer();openAuthModal()">
-        <span class="drawer-item-icon icon-blue">👤</span>
-        <span class="drawer-item-text">
-          <b>${isLogged ? "My Profile & Account" : "Login / Register"}</b>
-          <small>${isLogged ? "Account details & Advance status" : "10 sec free login — Unlock full data"}</small>
-        </span>
-        <span class="drawer-chevron">›</span>
-      </button>
-
-      ${isAdmin ? `
-        <button class="drawer-item" onclick="closeSideDrawer();openAdminFromModal()">
-          <span class="drawer-item-icon icon-amber">👑</span>
-          <span class="drawer-item-text">
-            <b>Owner Dashboard & APK Control</b>
-            <small>Live users, mobile numbers & updates</small>
-          </span>
-          <span class="drawer-item-badge badge-blue">Admin</span>
-        </button>
-      ` : ""}
-
       <div class="drawer-section-label">APP & SHARING</div>
 
       <button class="drawer-item" onclick="closeSideDrawer();openInstallPopup()">
         <span class="drawer-item-icon icon-green">📲</span>
         <span class="drawer-item-text">
-          <b>Install / Download App</b>
-          <small>${hasApk ? `Direct Android APK (${escapeHtml(remoteVer)})` : "Phone par 1-Tap App install karein"}</small>
+          <b>${hasAnyApkAvailable(cfg) ? `Download base.apk (${escapeHtml(remoteVer)})` : "Install / Download App"}</b>
+          <small>${hasAnyApkAvailable(cfg) ? `1-Click Android APK • ${escapeHtml(remoteVer)}` : "Phone par 1-Tap Free App install karein"}</small>
         </span>
-        <span class="drawer-item-badge badge-green">${hasApk ? "APK" : "Free"}</span>
+        <span class="drawer-item-badge badge-green">${hasAnyApkAvailable(cfg) ? "APK" : "Free"}</span>
       </button>
 
       <button class="drawer-item" onclick="closeSideDrawer();openShareModal()">
         <span class="drawer-item-icon icon-emerald">📤</span>
         <span class="drawer-item-text">
           <b>Share HD IPO Live</b>
-          <small>Fayde & Features ke saath doston ko bhejein</small>
+          <small>Family & doston ko WhatsApp link bhejein</small>
         </span>
         <span class="drawer-chevron">›</span>
       </button>
@@ -3090,23 +2940,11 @@ function renderSideDrawer() {
         </span>
         <span class="drawer-chevron">›</span>
       </button>
-
-      ${isLogged ? `
-        <div class="drawer-divider"></div>
-        <button class="drawer-item drawer-item-danger" onclick="closeSideDrawer();handleLogout()">
-          <span class="drawer-item-icon icon-red">🚪</span>
-          <span class="drawer-item-text">
-            <b>Logout</b>
-            <small>Is device se sign out karein</small>
-          </span>
-          <span class="drawer-chevron">›</span>
-        </button>
-      ` : ""}
     </div>
 
     <div class="drawer-footer">
       <div><b>HD IPO Live</b> • ${escapeHtml(remoteVer)}</div>
-      <small>Mainboard • SME • RHP Financials • Allotment</small>
+      <small>100% Free • Mainboard • SME • Allotment</small>
     </div>
   `;
 }

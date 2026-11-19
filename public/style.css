@@ -94,6 +94,29 @@ body {
   gap: 6px;
 }
 
+.header-share-btn {
+  width: 34px;
+  height: 31px;
+  border-radius: 20px;
+  border: 1px solid rgba(255, 255, 255, 0.3);
+  background-color: rgba(255, 255, 255, 0.16);
+  color: #ffffff;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  flex-shrink: 0;
+  transition: background-color 0.15s ease, transform 0.12s ease;
+}
+
+.header-share-btn:hover {
+  background-color: rgba(255, 255, 255, 0.28);
+}
+
+.header-share-btn:active {
+  transform: scale(0.95);
+}
+
 .dot {
   width: 8px;
   height: 8px;
