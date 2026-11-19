@@ -202,6 +202,20 @@ service cloud.firestore {
       allow delete: if isAdmin() && isValidId(activityId);
     }
 
+    function isValidAppConfig(data) {
+      return data.keys().hasAll(['apkUrl', 'appVersion', 'updateNotes', 'updatedAt'])
+        && data.keys().hasOnly(['apkUrl', 'appVersion', 'updateNotes', 'updatedAt'])
+        && data.apkUrl is string
+        && data.apkUrl.size() <= 500
+        && (data.apkUrl == '' || data.apkUrl.matches('^https://.*'))
+        && data.appVersion is string
+        && data.appVersion.size() >= 1
+        && data.appVersion.size() <= 30
+        && data.updateNotes is string
+        && data.updateNotes.size() <= 240
+        && data.updatedAt is timestamp;
+    }
+
     // === 4. ADMIN ALLOWLIST ===
     match /admins/{adminId} {
       allow get: if isVerifiedUser() && isValidId(adminId) && (isBootstrapAdmin() || request.auth.uid == adminId);
@@ -212,6 +226,24 @@ service cloud.firestore {
         && incoming().createdAt == request.time;
       allow update: if false;
       allow delete: if isBootstrapAdmin() && isValidId(adminId);
+    }
+
+    // === 5. PUBLIC APP DISTRIBUTION CONFIG (APK LINK, VERSION & UPDATE NOTES) ===
+    match /hd_config/{configId} {
+      allow get: if isValidId(configId) && configId == 'app';
+      allow list: if false;
+      allow create: if isBootstrapAdmin()
+        && isValidId(configId)
+        && configId == 'app'
+        && isValidAppConfig(incoming())
+        && incoming().updatedAt == request.time;
+      allow update: if isBootstrapAdmin()
+        && isValidId(configId)
+        && configId == 'app'
+        && isValidAppConfig(incoming())
+        && incoming().diff(existing()).affectedKeys().hasOnly(['apkUrl', 'appVersion', 'updateNotes', 'updatedAt'])
+        && incoming().updatedAt == request.time;
+      allow delete: if isBootstrapAdmin() && isValidId(configId);
     }
   }
 }

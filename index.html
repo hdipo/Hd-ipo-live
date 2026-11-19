@@ -22,6 +22,13 @@
     <!-- 1. TOP HEADER -->
     <header class="app-header">
       <div class="brand">
+        <button id="menuBtn" class="hamburger-btn" onclick="openSideDrawer()" aria-label="Open Menu" title="Menu">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round">
+            <line x1="3" y1="6" x2="21" y2="6"></line>
+            <line x1="3" y1="12" x2="21" y2="12"></line>
+            <line x1="3" y1="18" x2="21" y2="18"></line>
+          </svg>
+        </button>
         <div class="logo-box">HD</div>
         <div>
           <h1 class="app-title">HD IPO</h1>
@@ -29,12 +36,6 @@
         </div>
       </div>
       <div class="header-actions">
-        <button id="installBtn" class="install-pill" onclick="triggerInstallApp()" title="Mobile par App Install karein">
-          📲 Install
-        </button>
-        <button id="accountBtn" class="account-pill" onclick="openAuthModal()" title="Login / Profile">
-          👤 Login
-        </button>
         <button id="syncBtn" class="live-pill" onclick="syncLiveData(true)" style="color:#fff;cursor:pointer;">
           <span class="dot"></span> SYNC
         </button>
@@ -121,6 +122,12 @@
   </div>
 <!-- ANALYSIS SCREEN MODAL -->
   <div id="analysisModal" class="modal hidden"></div>
+<!-- 3-LINE SIDE NAVIGATION DRAWER -->
+  <div id="sideDrawerOverlay" class="drawer-overlay hidden" onclick="if(event.target===this)closeSideDrawer()">
+    <aside id="sideDrawer" class="side-drawer" aria-label="App Navigation Menu"></aside>
+  </div>
+<!-- FLOATING INSTALL / UPDATE / SHARE POPUP -->
+  <div id="hdPopupOverlay" class="hd-popup-overlay hidden" onclick="if(event.target===this)closePopupOverlay()"></div>
   <script type="module" src="/src/hdipo-auth.ts"></script>
   <script src="data.js"></script>
   <script src="app.js"></script>

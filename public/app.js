@@ -1,12 +1,33 @@
+let appSettings = (() => {
+  try {
+    const raw = JSON.parse(localStorage.getItem("hdAppSettings") || "{}");
+    return {
+      defaultCategory: ["all", "mainboard", "sme"].includes(raw.defaultCategory) ? raw.defaultCategory : "all",
+      defaultTab: ["live", "upcoming", "closed"].includes(raw.defaultTab) ? raw.defaultTab : "live",
+      defaultRegistrar: typeof raw.defaultRegistrar === "string" && raw.defaultRegistrar.startsWith("https://")
+        ? raw.defaultRegistrar
+        : "https://in.mpms.mufg.com/Initial_Offer/public-issues.html",
+      autoInstallPopup: raw.autoInstallPopup !== false
+    };
+  } catch (_) {
+    return {
+      defaultCategory: "all",
+      defaultTab: "live",
+      defaultRegistrar: "https://in.mpms.mufg.com/Initial_Offer/public-issues.html",
+      autoInstallPopup: true
+    };
+  }
+})();
+
 let currentPage = "home";
-let currentCategory = "all";
-let currentTab = "live";
+let currentCategory = appSettings.defaultCategory;
+let currentTab = appSettings.defaultTab;
 let currentSearch = "";
 let savedIds = JSON.parse(localStorage.getItem("hdIpoSaved") || "[]");
 let customIPOs = JSON.parse(localStorage.getItem("hdCustomIPOs") || "[]");
 let familyPans = JSON.parse(localStorage.getItem("hdFamilyPans") || "[]");
 let remoteIPOs = JSON.parse(localStorage.getItem("hdRemoteIPOs") || "[]");
-let selectedRegistrar = "https://in.mpms.mufg.com/Initial_Offer/public-issues.html";
+let selectedRegistrar = appSettings.defaultRegistrar;
 let queueIndex = -1;
 
 const mainContent = document.getElementById("mainContent");
@@ -368,11 +389,28 @@ function renderIPOs() {
 
   const totalCount = filtered.length;
   const shown = filtered.slice(0, 50);
+  const showBanner = !isStandaloneApp && !sessionStorage.getItem("hdInstallBannerDismissed");
+  const cfg = (window.hdAuth && window.hdAuth.appConfig) ? window.hdAuth.appConfig : { apkUrl: "", appVersion: "v1.0" };
+  const hasApk = Boolean(cfg.apkUrl && /^https:\/\//i.test(cfg.apkUrl));
+  const installBannerHtml = showBanner ? `
+    <div class="install-banner">
+      <div class="install-banner-left">
+        <b>📲 HD IPO Live App ${hasApk ? `(${escapeHtml(cfg.appVersion || "v1.0")})` : ""}</b>
+        <small>Live GMP, 3-Yr Financials & Family Allotment — 1-Tap Install</small>
+      </div>
+      <div style="display:flex;align-items:center;gap:5px;">
+        <button class="btn-analyze" style="background:#15803d;" onclick="openInstallPopup()">Install Now</button>
+        <button class="btn-analyze" style="background:#1d4ed8;" onclick="openShareModal()" title="Share">📤</button>
+        <button class="banner-close" onclick="sessionStorage.setItem('hdInstallBannerDismissed','1');renderIPOs();" aria-label="Close">✕</button>
+      </div>
+    </div>
+  ` : "";
+
   const note = totalCount > 50
     ? `<p style="font-size:11.5px;color:#475569;margin-bottom:8px;">Showing latest 50 of <b>${totalCount}</b> IPOs — kisi bhi purane ya naye IPO ke liye upar Search karein!</p>`
     : (q ? `<p style="font-size:11.5px;color:#1d4ed8;margin-bottom:8px;">Search Results across Past, Live & Future: <b>${totalCount}</b> found</p>` : "");
 
-  mainContent.innerHTML = note + shown.map(buildIPOCard).join("");
+  mainContent.innerHTML = installBannerHtml + note + shown.map(buildIPOCard).join("");
 }
 
 function buildIPOCard(ipo) {
@@ -1040,12 +1078,18 @@ navItems.forEach((item) => {
   });
 });
 
-// PWA MOBILE INSTALL SUPPORT (Android Chrome 1-Tap + iPhone Safari + APK Guide)
+// ===== PWA INSTALL POPUP, DIRECT APK DOWNLOAD, RICH SHARE & VERSION UPDATE POPUP =====
 let deferredInstallPrompt = null;
 const installBtn = document.getElementById("installBtn");
+const popupOverlay = document.getElementById("hdPopupOverlay");
 const isStandaloneApp = window.matchMedia("(display-mode: standalone)").matches || window.navigator.standalone === true;
 const isIosDevice = /iphone|ipad|ipod/i.test(navigator.userAgent);
+const isAndroidDevice = /android/i.test(navigator.userAgent);
 const isInIframe = (() => { try { return window.self !== window.top; } catch (_) { return true; } })();
+
+const HD_VERSION_STORAGE_KEY = "hdUserAppVersion";
+let updatePopupShownThisSession = false;
+let autoInstallPopupTriggered = false;
 
 if (installBtn && isStandaloneApp) {
   installBtn.classList.add("hidden");
@@ -1063,76 +1107,355 @@ window.addEventListener("beforeinstallprompt", (e) => {
 window.addEventListener("appinstalled", () => {
   deferredInstallPrompt = null;
   if (installBtn) installBtn.classList.add("hidden");
+  closePopupOverlay();
   showNotice("HD IPO App aapke mobile par install ho gaya!");
 });
 
-function openInstallGuide() {
-  const currentUrl = window.location.origin + "/";
-  analysisModal.innerHTML = `
-    <div class="modal-header">
-      <button class="back-btn" onclick="closeAnalysis()">← Back</button>
-      <div class="modal-title">📲 Mobile Install & APK Guide</div>
-      <span style="width:48px;"></span>
-    </div>
-    <div class="modal-body">
-      ${isInIframe ? `
-        <div class="section-card" style="background:#fffbeb;border:1.5px solid #f59e0b;">
-          <div class="section-heading">⚠️ Preview Window mein Install Blocked hota hai</div>
-          <p class="about-text">Aap abhi Preview frame ke andar hain. Browser security ki wajah se preview box se app install nahi hota — pehle is app ko <b>Full Chrome Tab</b> mein kholein:</p>
-          <div style="display:flex;gap:8px;margin-top:10px;flex-wrap:wrap;">
-            <a href="${escapeHtml(currentUrl)}" target="_blank" rel="noopener noreferrer" class="btn-copy-open" style="background:#1d4ed8;text-decoration:none;display:inline-block;">🌐 Chrome mein Kholein ↗</a>
-            <button class="btn-copy-open" onclick="copyTextSafe('${escapeHtml(currentUrl)}');showNotice('App Link Copied! Mobile Chrome mein paste karein.')">📋 Link Copy Karein</button>
-          </div>
-        </div>
-      ` : ""}
+function closePopupOverlay() {
+  if (popupOverlay) {
+    popupOverlay.classList.add("hidden");
+    popupOverlay.innerHTML = "";
+  }
+}
 
-      <div class="section-card">
-        <div class="section-heading">📱 Option 1: Direct Mobile App Install (Free, 5 Seconds)</div>
-        ${isIosDevice ? `
-          <ul class="pm-list compact-list">
-            <li>1. Yeh page <b>Safari</b> browser mein kholein.</li>
-            <li>2. Niche <b>Share (↑)</b> button par tap karein.</li>
-            <li>3. <b>"Add to Home Screen"</b> chunein aur <b>Add</b> dabayein.</li>
-          </ul>
-        ` : `
-          <ul class="pm-list compact-list">
-            <li>1. Is link ko apne phone ke <b>Google Chrome</b> mein kholein.</li>
-            <li>2. Upar <b>📲 Install</b> button par tap karein, <b>YA</b> Chrome ke upar-right <b>3 Dots (⋮)</b> menu kholein.</li>
-            <li>3. <b>"Install app"</b> ya <b>"Add to Home screen" → Install</b> par tap karein.</li>
-            <li>4. HD IPO aapke phone mein <b>full-screen App</b> bankar icon ke saath aa jayega!</li>
-          </ul>
-        `}
+function getAppConfigSafe() {
+  return (window.hdAuth && window.hdAuth.appConfig)
+    ? window.hdAuth.appConfig
+    : { apkUrl: "", appVersion: "v1.0", updateNotes: "", loaded: false };
+}
+
+function normalizeVersionParts(ver) {
+  const clean = String(ver || "1.0").trim().replace(/^v/i, "");
+  const nums = clean.split(/[^0-9]+/).filter(Boolean).map(n => parseInt(n, 10));
+  return nums.length ? nums : [1, 0];
+}
+
+function compareAppVersions(vA, vB) {
+  const a = normalizeVersionParts(vA);
+  const b = normalizeVersionParts(vB);
+  const maxLen = Math.max(a.length, b.length);
+  for (let i = 0; i < maxLen; i++) {
+    const na = a[i] || 0;
+    const nb = b[i] || 0;
+    if (na > nb) return 1;
+    if (na < nb) return -1;
+  }
+  return 0;
+}
+
+function getLocalAppVersion(remoteVersion) {
+  let savedVer = localStorage.getItem(HD_VERSION_STORAGE_KEY);
+  if (savedVer) return savedVer;
+  const hasPreviousData = Boolean(
+    localStorage.getItem("hdRemoteIPOs") ||
+    localStorage.getItem("hdIpoSaved") ||
+    localStorage.getItem("hdFamilyPans") ||
+    localStorage.getItem("hdCustomIPOs")
+  );
+  // Returning users who used earlier versions start from v1.0 so they receive new update prompts
+  savedVer = hasPreviousData ? "v1.0" : (remoteVersion || "v1.0");
+  try { localStorage.setItem(HD_VERSION_STORAGE_KEY, savedVer); } catch (_) {}
+  return savedVer;
+}
+
+function startApkFileDownload(apkUrl) {
+  if (!apkUrl || !/^https:\/\//i.test(apkUrl)) return false;
+  const a = document.createElement("a");
+  a.href = apkUrl;
+  a.setAttribute("download", "HD-IPO.apk");
+  a.target = "_blank";
+  a.rel = "noopener noreferrer";
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  return true;
+}
+
+function openInstallPopup() {
+  const cfg = getAppConfigSafe();
+  const hasApk = Boolean(cfg.apkUrl && /^https:\/\//i.test(cfg.apkUrl));
+  const canNativeInstall = Boolean(deferredInstallPrompt);
+  const versionLabel = cfg.appVersion || "v1.0";
+
+  if (!popupOverlay) {
+    openInstallGuide();
+    return;
+  }
+
+  const primaryLabel = hasApk && (isAndroidDevice || !canNativeInstall)
+    ? `📲 Install Now (Download APK ${escapeHtml(versionLabel)})`
+    : "📲 Install Now";
+
+  popupOverlay.innerHTML = `
+    <div class="hd-popup-card">
+      <button class="hd-popup-x" onclick="dismissInstallPopup()" aria-label="Close">✕</button>
+      <div class="hd-popup-brand">
+        <img src="/pwa-192x192.png" alt="HD IPO" class="hd-popup-icon">
+        <div>
+          <div class="hd-popup-badge">OFFICIAL MOBILE APP • ${escapeHtml(versionLabel)}</div>
+          <h3 class="hd-popup-title">HD IPO Live Install Karein</h3>
+        </div>
       </div>
 
-      <div class="section-card" style="border:1.5px solid #93c5fd;background:#eff6ff;">
-        <div class="section-heading">📦 Option 2: Asli .APK File Kaise Banayein?</div>
-        <p class="about-text" style="margin-bottom:6px;">
-          <b>Zaroori baat:</b> Preview / Dev link par Google login laga hota hai, isliye APK builder websites usko directly scan nahi kar paati. Real <b>.APK</b> banane ke 3 simple steps:
-        </p>
-        <ul class="pm-list compact-list">
-          <li>1. AI Studio ke upar-right mein <b>🚀 Deploy / Share App</b> button se is app ko <b>Public URL</b> par deploy karein (allow unauthenticated access).</li>
-          <li>2. Apna Deployed Public URL copy karke <b>pwabuilder.com</b> par paste karein (saare icons 192px, 512px, maskable & Service Worker already 100% ready hain).</li>
-          <li>3. <b>Package for Stores → Android → Generate Package</b> par click karein — aapki ready-to-install <b>HD-IPO.apk</b> file download ho jayegi!</li>
-        </ul>
+      <p class="hd-popup-desc">
+        Apne phone par <b>HD IPO</b> install karein — bina browser ke fast full-screen experience aur live updates ke saath:
+      </p>
+
+      <ul class="hd-popup-features">
+        <li>📈 <b>Live Mainboard & SME GMP</b> + Listing Gain Estimate</li>
+        <li>📊 <b>3–4 Saal ka Real Financial Data</b> (Company Strong vs Market Demand)</li>
+        <li>👨‍👩‍👧‍👦 <b>1-Click Family PAN Allotment</b> Checker & Target/SL</li>
+      </ul>
+
+      <div id="installPopupStatus" class="hd-popup-status hidden"></div>
+
+      <button id="popupInstallNowBtn" class="hd-popup-btn-primary" onclick="handleDirectInstallNow()">
+        ${primaryLabel}
+      </button>
+
+      ${hasApk && canNativeInstall ? `
+        <button class="hd-popup-btn-blue" onclick="runNativeInstallPrompt()">
+          ⚡ 1-Tap Instant Web App Install (Bina APK Download)
+        </button>
+      ` : ""}
+
+      <div class="hd-popup-row">
+        <button class="hd-popup-btn-outline" onclick="openShareModal()">📤 Share App</button>
+        <button class="hd-popup-btn-cancel" onclick="dismissInstallPopup()">✖️ Cancel</button>
       </div>
     </div>
   `;
-  analysisModal.classList.remove("hidden");
-  analysisModal.scrollTop = 0;
+  popupOverlay.classList.remove("hidden");
 }
 
-async function triggerInstallApp() {
-  if (deferredInstallPrompt) {
-    deferredInstallPrompt.prompt();
-    const choice = await deferredInstallPrompt.userChoice;
-    deferredInstallPrompt = null;
-    if (choice && choice.outcome === "accepted" && installBtn) {
-      installBtn.classList.add("hidden");
+function dismissInstallPopup() {
+  sessionStorage.setItem("hdInstallPopupClosed", "1");
+  closePopupOverlay();
+}
+
+async function handleDirectInstallNow() {
+  const cfg = getAppConfigSafe();
+  const hasApk = Boolean(cfg.apkUrl && /^https:\/\//i.test(cfg.apkUrl));
+  const statusEl = document.getElementById("installPopupStatus");
+
+  // 1) If native 1-tap install is ready AND (not Android APK or no APK configured) -> trigger native install immediately!
+  if (deferredInstallPrompt && (!hasApk || !isAndroidDevice)) {
+    await runNativeInstallPrompt();
+    return;
+  }
+
+  // 2) If direct APK link is configured -> start APK download immediately on single click!
+  if (hasApk) {
+    startApkFileDownload(cfg.apkUrl);
+    try { localStorage.setItem(HD_VERSION_STORAGE_KEY, cfg.appVersion || "v1.0"); } catch (_) {}
+    showNotice("⬇️ HD IPO APK download shuru ho gaya! File par tap karke Install karein.");
+    if (statusEl) {
+      statusEl.innerHTML = `
+        <b>✅ APK Download Shuru Ho Gaya!</b><br>
+        Download complete hone par file par tap karein → <b>Install</b> dabayein.<br>
+        <a href="${escapeHtml(cfg.apkUrl)}" target="_blank" rel="noopener noreferrer" download style="color:#15803d;font-weight:800;text-decoration:underline;">Agar download na ho to yahan tap karein ↗</a>
+      `;
+      statusEl.classList.remove("hidden");
     }
     return;
   }
-  openInstallGuide();
+
+  // 3) If native 1-tap install prompt is ready (fallback) -> trigger native install
+  if (deferredInstallPrompt) {
+    await runNativeInstallPrompt();
+    return;
+  }
+
+  // 4) Otherwise show instant manual 2-step guide right inside the popup
+  const currentUrl = window.location.origin + "/?install=1";
+  if (statusEl) {
+    if (isInIframe) {
+      statusEl.innerHTML = `
+        <b>1-Tap Install ke liye Full Browser mein kholein:</b><br>
+        <a href="${escapeHtml(currentUrl)}" target="_blank" rel="noopener noreferrer" style="display:inline-block;margin-top:6px;background:#1d4ed8;color:#fff;padding:6px 10px;border-radius:7px;text-decoration:none;font-weight:700;">🌐 Chrome / Safari mein Kholein ↗</a>
+      `;
+    } else if (isIosDevice) {
+      statusEl.innerHTML = `<b>iPhone Install:</b> Safari mein niche <b>Share (↑)</b> dabayein → <b>"Add to Home Screen"</b> → <b>Add</b>.`;
+    } else {
+      statusEl.innerHTML = `<b>Android Chrome Install:</b> Upar-right <b>3 Dots (⋮)</b> par tap karein → <b>"Install app"</b> ya <b>"Add to Home screen" → Install</b>.`;
+    }
+    statusEl.classList.remove("hidden");
+  } else {
+    openInstallGuide();
+  }
 }
+
+function openInstallGuide() {
+  openInstallPopup();
+}
+
+async function runNativeInstallPrompt() {
+  if (!deferredInstallPrompt) {
+    openInstallPopup();
+    return;
+  }
+  deferredInstallPrompt.prompt();
+  const choice = await deferredInstallPrompt.userChoice;
+  deferredInstallPrompt = null;
+  if (choice && choice.outcome === "accepted") {
+    const cfg = getAppConfigSafe();
+    try { localStorage.setItem(HD_VERSION_STORAGE_KEY, cfg.appVersion || "v1.0"); } catch (_) {}
+    if (installBtn) installBtn.classList.add("hidden");
+    closePopupOverlay();
+    closeAnalysis();
+  }
+}
+
+async function triggerInstallApp() {
+  openInstallPopup();
+}
+
+// ===== APP UPDATE POPUP (Har Baar Open Par Aayega Jab Tak Update Now Na Ho) =====
+function openUpdatePopup(isPreview = false) {
+  if (!popupOverlay) return;
+  const cfg = getAppConfigSafe();
+  const remoteVer = cfg.appVersion || "v1.1";
+  const localVer = isPreview ? "v1.0" : (localStorage.getItem(HD_VERSION_STORAGE_KEY) || "v1.0");
+  const hasApk = Boolean(cfg.apkUrl && /^https:\/\//i.test(cfg.apkUrl));
+  const notes = (cfg.updateNotes || "").trim();
+
+  popupOverlay.innerHTML = `
+    <div class="hd-popup-card update-card">
+      <button class="hd-popup-x" onclick="cancelUpdatePopup()" aria-label="Close">✕</button>
+      <div class="hd-popup-brand">
+        <img src="/pwa-192x192.png" alt="HD IPO" class="hd-popup-icon">
+        <div>
+          <div class="hd-popup-badge update-badge">${isPreview ? "PREVIEW • " : ""}🚀 NEW UPDATE AVAILABLE</div>
+          <h3 class="hd-popup-title">HD IPO Update Karein!</h3>
+        </div>
+      </div>
+
+      <div class="version-compare-bar">
+        <span>Purana: <b>${escapeHtml(localVer)}</b></span>
+        <span style="color:#1d4ed8;font-weight:900;">→</span>
+        <span style="color:#15803d;">Naya: <b>${escapeHtml(remoteVer)}</b></span>
+      </div>
+
+      <p class="hd-popup-desc">
+        HD IPO ka naya version (<b>${escapeHtml(remoteVer)}</b>) aa gaya hai. Naye features aur fast performance ke liye abhi update karein!
+      </p>
+
+      ${notes ? `
+        <div class="update-notes-box">
+          <b>✨ Is Update mein Kya Naya Hai:</b>
+          <div>${escapeHtml(notes)}</div>
+        </div>
+      ` : ""}
+
+      <div id="updatePopupStatus" class="hd-popup-status hidden"></div>
+
+      <button class="hd-popup-btn-primary" onclick="runAppUpdateNow(${isPreview ? "true" : "false"})">
+        ⬇️ Update Now (${escapeHtml(remoteVer)})
+      </button>
+
+      <button class="hd-popup-btn-cancel" style="width:100%;margin-top:8px;" onclick="cancelUpdatePopup()">
+        ✖️ Cancel (Baad Mein Update Karein)
+      </button>
+      <p style="font-size:10.5px;color:#64748b;text-align:center;margin-top:6px;">
+        Cancel karne par agli baar app kholne par fir se Update option dikhega.
+      </p>
+    </div>
+  `;
+  popupOverlay.classList.remove("hidden");
+}
+
+function cancelUpdatePopup() {
+  // Deliberately DO NOT update HD_VERSION_STORAGE_KEY in localStorage,
+  // so every time the user re-opens the app, the Update Now popup appears again!
+  closePopupOverlay();
+}
+
+async function runAppUpdateNow(isPreview = false) {
+  const cfg = getAppConfigSafe();
+  const remoteVer = cfg.appVersion || "v1.0";
+  const hasApk = Boolean(cfg.apkUrl && /^https:\/\//i.test(cfg.apkUrl));
+  const statusEl = document.getElementById("updatePopupStatus");
+
+  if (isPreview) {
+    showNotice("Preview Mode: Asli user par ye button naya APK download / App update shuru karega!");
+    closePopupOverlay();
+    return;
+  }
+
+  try { localStorage.setItem(HD_VERSION_STORAGE_KEY, remoteVer); } catch (_) {}
+
+  if (hasApk) {
+    startApkFileDownload(cfg.apkUrl);
+    showNotice(`⬇️ HD IPO ${remoteVer} download shuru ho gaya! File tap karke Update/Install karein.`);
+    if (statusEl) {
+      statusEl.innerHTML = `
+        <b>✅ Naya APK (${escapeHtml(remoteVer)}) Download Shuru Ho Gaya!</b><br>
+        Download hone ke baad file par tap karke <b>Update / Install</b> karein.<br>
+        <a href="${escapeHtml(cfg.apkUrl)}" target="_blank" rel="noopener noreferrer" download style="color:#15803d;font-weight:800;text-decoration:underline;">Direct Download Link ↗</a>
+      `;
+      statusEl.classList.remove("hidden");
+    }
+    return;
+  }
+
+  // PWA / Web update: clear caches, update Service Worker, and reload fresh!
+  showNotice(`⏳ HD IPO ${remoteVer} par update ho raha hai...`);
+  try {
+    if ("caches" in window) {
+      const keys = await caches.keys();
+      await Promise.all(keys.map(k => caches.delete(k)));
+    }
+    if ("serviceWorker" in navigator) {
+      const regs = await navigator.serviceWorker.getRegistrations();
+      await Promise.all(regs.map(r => r.update().catch(() => {})));
+    }
+  } catch (_) {}
+  window.location.reload();
+}
+
+function checkStartupPopups() {
+  const cfg = getAppConfigSafe();
+  const remoteVer = cfg.appVersion || "v1.0";
+  const localVer = getLocalAppVersion(remoteVer);
+
+  // 1) Priority: If Admin published a newer appVersion -> show Update Now / Cancel popup on EVERY app open!
+  if (cfg.loaded && compareAppVersions(remoteVer, localVer) > 0 && !updatePopupShownThisSession) {
+    updatePopupShownThisSession = true;
+    openUpdatePopup(false);
+    return;
+  }
+
+  // 2) If opened in browser (not installed standalone) -> show sleek Install Now popup!
+  const openedViaShareLink = /[?&](install|share|ref)=/i.test(window.location.search);
+  const popupAlreadyOpen = popupOverlay && !popupOverlay.classList.contains("hidden");
+  const modalAlreadyOpen = analysisModal && !analysisModal.classList.contains("hidden");
+  const allowAutoPopup = openedViaShareLink || (appSettings.autoInstallPopup && !sessionStorage.getItem("hdInstallPopupClosed"));
+  if (
+    !isStandaloneApp &&
+    !autoInstallPopupTriggered &&
+    !updatePopupShownThisSession &&
+    !popupAlreadyOpen &&
+    !modalAlreadyOpen &&
+    allowAutoPopup
+  ) {
+    autoInstallPopupTriggered = true;
+    const delayMs = openedViaShareLink ? 450 : 1200;
+    setTimeout(() => {
+      const stillClear =
+        (!popupOverlay || popupOverlay.classList.contains("hidden")) &&
+        (!analysisModal || analysisModal.classList.contains("hidden"));
+      if (stillClear && !isStandaloneApp && !updatePopupShownThisSession) {
+        openInstallPopup();
+      }
+    }, delayMs);
+  }
+}
+
+window.addEventListener("hd-config-loaded", () => {
+  if (currentPage === "home") renderIPOs();
+  refreshOpenDrawer();
+  checkStartupPopups();
+});
 
 // ===== MOBILE LOGIN, CLOUD SYNC & OWNER ADMIN DASHBOARD =====
 let pendingReturnIpoId = null;
@@ -1146,18 +1469,91 @@ function formatShortTime(ts) {
   return d.toLocaleString("en-IN", { day: "2-digit", month: "short", hour: "2-digit", minute: "2-digit" });
 }
 
-function shareAppWithFriends() {
-  const url = window.location.origin + "/";
-  const shareText = `📊 HD IPO App — Live Mainboard & SME IPO GMP, 3-Year RHP Financials & Fast Family PAN Allotment check karein: ${url}`;
+function getShareAppLink() {
+  return window.location.origin + "/?install=1";
+}
+
+function buildSharePromoMessage() {
+  const url = getShareAppLink();
+  const cfg = getAppConfigSafe();
+  const ver = cfg.appVersion || "v1.0";
+  return [
+    `🚀 *HD IPO Live (${ver}) — Free IPO GMP & Allotment App*`,
+    ``,
+    `Ab har IPO mein apply karne se pehle poora data ek jagah dekhein:`,
+    `✅ *Live Mainboard & SME IPO GMP* (Estimated Profit ke saath)`,
+    `✅ *3–4 Saal ka Real Financial Data* (Revenue, Profit, Net Worth & Debt)`,
+    `✅ *Company Strong hai ya Sirf Market Demand?* (Smart Data Score)`,
+    `✅ *1-Click Family PAN Allotment Checker* (Sabhi family members ek saath)`,
+    `✅ *Live Subscription, Listing Target & Stop-Loss Calculator*`,
+    `✅ *100% Free & Real-Time Updates!*`,
+    ``,
+    `📲 *Direct Install / Download Link:*`,
+    url
+  ].join("\n");
+}
+
+function openShareModal() {
+  if (!popupOverlay) {
+    shareNativeDirect();
+    return;
+  }
+  const msg = buildSharePromoMessage();
+  const waUrl = "https://wa.me/?text=" + encodeURIComponent(msg);
+
+  popupOverlay.innerHTML = `
+    <div class="hd-popup-card">
+      <button class="hd-popup-x" onclick="closePopupOverlay()" aria-label="Close">✕</button>
+      <div class="hd-popup-brand">
+        <img src="/pwa-192x192.png" alt="HD IPO" class="hd-popup-icon">
+        <div>
+          <div class="hd-popup-badge">SHARE HD IPO LIVE</div>
+          <h3 class="hd-popup-title">Doston & Family ko Bhejein</h3>
+        </div>
+      </div>
+
+      <p class="hd-popup-desc">
+        Neeche diya gaya message <b>HD IPO Live</b> ke sabhi fayde & features aur direct <b>Install Link</b> ke saath share hoga:
+      </p>
+
+      <div class="share-preview-box">${escapeHtml(msg).replace(/\n/g, "<br>")}</div>
+
+      <a href="${waUrl}" target="_blank" rel="noopener noreferrer" class="hd-popup-btn-primary" style="text-decoration:none;display:block;text-align:center;">
+        💬 WhatsApp par Bhejein
+      </a>
+
+      <div class="hd-popup-row" style="margin-top:8px;">
+        <button class="hd-popup-btn-blue" style="margin-top:0;flex:1;" onclick="shareNativeDirect()">📲 Share (All Apps)</button>
+        <button class="hd-popup-btn-outline" style="flex:1;" onclick="copyFullShareMessage()">📋 Copy Text</button>
+      </div>
+    </div>
+  `;
+  popupOverlay.classList.remove("hidden");
+}
+
+function copyFullShareMessage() {
+  copyTextSafe(buildSharePromoMessage());
+  showNotice("HD IPO Live ka message + Install Link Copy ho gaya! Kahin bhi Paste karke bhej dein.");
+}
+
+function shareNativeDirect() {
+  const url = getShareAppLink();
+  const text = buildSharePromoMessage();
   if (navigator.share) {
-    navigator.share({ title: "HD IPO - Live GMP & Financials", text: shareText, url }).catch(() => {
-      copyTextSafe(url);
-      showNotice("App Link Copied! WhatsApp par Family & Doston ko bhej dein.");
+    navigator.share({
+      title: "HD IPO Live — GMP, Financials & Allotment App",
+      text,
+      url
+    }).catch(() => {
+      copyFullShareMessage();
     });
   } else {
-    copyTextSafe(url);
-    showNotice("App Link Copied! WhatsApp par Family & Doston ko bhej dein.");
+    copyFullShareMessage();
   }
+}
+
+function shareAppWithFriends() {
+  openShareModal();
 }
 
 function openAuthModal(returnIpoId = null) {
@@ -1421,6 +1817,34 @@ async function renderAdminPage(forceReload = false) {
       <div class="admin-stat-box"><small>Mobile App Installs</small><strong style="color:#b45309;">${stats.appInstalls}</strong></div>
     </div>
 
+    <div class="section-card" style="background:#f0fdf4;border:1.5px solid #86efac;">
+      <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;margin-bottom:6px;">
+        <div class="section-heading" style="margin:0;">📦 APK Version & Auto-Update Control</div>
+        <span class="badge badge-mainboard">Live: ${escapeHtml(window.hdAuth.appConfig?.appVersion || "v1.0")}</span>
+      </div>
+      <p class="about-text" style="margin-bottom:8px;">
+        Jab bhi aap naya APK / Update laayein, yahan <b>Version badha kar</b> (jaise <b>v1.0 → v1.1</b>) aur naya APK link daal kar Save karein — sabhi purane users ko <b>har baar app open karne par Update Now / Cancel</b> popup dikhega!
+      </p>
+      <div class="form-field">
+        <label>Direct APK Download URL (https://...)</label>
+        <input type="url" id="adminApkUrl" value="${escapeHtml(window.hdAuth.appConfig?.apkUrl || "")}" placeholder="https://github.com/hdipo/.../releases/download/v1.1/HD-IPO.apk">
+      </div>
+      <div class="form-grid">
+        <div class="form-field">
+          <label>APK / App Version (e.g. v1.1)</label>
+          <input type="text" id="adminApkVersion" value="${escapeHtml(window.hdAuth.appConfig?.appVersion || "v1.0")}" placeholder="v1.1" maxlength="30">
+        </div>
+        <div class="form-field">
+          <label>Update Notes (Kya Naya Hai)</label>
+          <input type="text" id="adminUpdateNotes" value="${escapeHtml(window.hdAuth.appConfig?.updateNotes || "")}" placeholder="Fast Live GMP & Bug Fixes" maxlength="240">
+        </div>
+      </div>
+      <div style="display:flex;gap:8px;flex-wrap:wrap;">
+        <button id="saveApkCfgBtn" class="btn-primary-full" style="background:#15803d;margin:0;flex:1;" onclick="handleSaveApkConfig()">🚀 Save & Push Update</button>
+        <button class="btn-copy-open" style="background:#1d4ed8;padding:10px 12px;" onclick="openUpdatePopup(true)">👁️ Preview Popup</button>
+      </div>
+    </div>
+
     <div class="section-card">
       <div class="section-heading">👥 Registered Users (${filteredUsers.length})</div>
       <div class="form-field">
@@ -1461,16 +1885,362 @@ async function renderAdminPage(forceReload = false) {
   `;
 }
 
+async function handleSaveApkConfig() {
+  const urlEl = document.getElementById("adminApkUrl");
+  const verEl = document.getElementById("adminApkVersion");
+  const notesEl = document.getElementById("adminUpdateNotes");
+  const btn = document.getElementById("saveApkCfgBtn");
+  const urlVal = urlEl ? urlEl.value.trim() : "";
+  const verVal = verEl ? verEl.value.trim() : "v1.0";
+  const notesVal = notesEl ? notesEl.value.trim() : "";
+  if (btn) { btn.disabled = true; btn.textContent = "⏳ Saving..."; }
+  try {
+    await window.hdAuth.saveAppConfig(urlVal, verVal, notesVal);
+    showNotice(`✅ ${verVal} Save & Live ho gaya! Purane users ko ab app open karte hi Update Now popup dikhega.`);
+    renderAdminPage(false);
+  } catch (err) {
+    if (btn) { btn.disabled = false; btn.textContent = "🚀 Save & Push Update"; }
+    showNotice(err && err.message ? err.message : "Sahi https:// APK link aur version daalein.");
+  }
+}
+
+// ===== 3-LINE SIDE DRAWER MENU & PROFESSIONAL SETTINGS =====
+const sideDrawerOverlay = document.getElementById("sideDrawerOverlay");
+const sideDrawer = document.getElementById("sideDrawer");
+
+function renderSideDrawer() {
+  if (!sideDrawer) return;
+  const ha = window.hdAuth;
+  const isLogged = Boolean(ha && ha.isLoggedIn());
+  const isAdmin = Boolean(ha && ha.isAdmin());
+  const hasAdvance = Boolean(ha && ha.hasAdvanceAccess());
+  const profile = ha && ha.profile;
+  const cfg = getAppConfigSafe();
+  const hasApk = Boolean(cfg.apkUrl && /^https:\/\//i.test(cfg.apkUrl));
+  const remoteVer = cfg.appVersion || "v1.0";
+  const localVer = getLocalAppVersion(remoteVer);
+  const hasUpdate = cfg.loaded && compareAppVersions(remoteVer, localVer) > 0;
+
+  const displayName = isLogged
+    ? (profile?.name || ha.user?.displayName || (isAdmin ? "App Owner" : "HD IPO Member"))
+    : "Guest Investor";
+  const subInfo = isLogged
+    ? (profile?.mobile ? `+91 ${profile.mobile}` : (ha.user?.email || "Verified Account"))
+    : "Login karke 3–4 Saal ka Financial Data unlock karein";
+  const photoUrl = isLogged && ha.user?.photoURL ? ha.user.photoURL : "";
+  const initials = displayName.trim().slice(0, 2).toUpperCase() || "HD";
+
+  sideDrawer.innerHTML = `
+    <div class="drawer-header">
+      <button class="drawer-close-btn" onclick="closeSideDrawer()" aria-label="Close Menu">✕</button>
+      <div class="drawer-profile-row">
+        <div class="drawer-avatar">
+          ${photoUrl ? `<img src="${escapeHtml(photoUrl)}" alt="${escapeHtml(displayName)}">` : escapeHtml(initials)}
+        </div>
+        <div class="drawer-user-info">
+          <div class="drawer-user-name">${escapeHtml(displayName)}</div>
+          <div class="drawer-user-sub">${escapeHtml(subInfo)}</div>
+          ${isAdmin
+            ? `<span class="drawer-role-tag admin">👑 Owner / Admin</span>`
+            : (hasAdvance
+                ? `<span class="drawer-role-tag verified">✓ Advance Unlocked</span>`
+                : `<span class="drawer-role-tag guest">Basic Mode</span>`)}
+        </div>
+      </div>
+      ${!isLogged ? `
+        <button class="drawer-login-cta" onclick="closeSideDrawer();openAuthModal()">
+          🔐 Free Mobile Login Karein →
+        </button>
+      ` : (!hasAdvance && !isAdmin ? `
+        <button class="drawer-login-cta" onclick="closeSideDrawer();openAuthModal()">
+          📱 Mobile Number Add Karein (Step 2) →
+        </button>
+      ` : "")}
+    </div>
+
+    <div class="drawer-body">
+      <div class="drawer-section-label">ACCOUNT & ACCESS</div>
+
+      <button class="drawer-item" onclick="closeSideDrawer();openAuthModal()">
+        <span class="drawer-item-icon icon-blue">👤</span>
+        <span class="drawer-item-text">
+          <b>${isLogged ? "My Profile & Account" : "Login / Register"}</b>
+          <small>${isLogged ? "Account details & Advance status" : "10 sec free login — Unlock full data"}</small>
+        </span>
+        <span class="drawer-chevron">›</span>
+      </button>
+
+      ${isAdmin ? `
+        <button class="drawer-item" onclick="closeSideDrawer();openAdminFromModal()">
+          <span class="drawer-item-icon icon-amber">👑</span>
+          <span class="drawer-item-text">
+            <b>Owner Dashboard & APK Control</b>
+            <small>Live users, mobile numbers & updates</small>
+          </span>
+          <span class="drawer-item-badge badge-blue">Admin</span>
+        </button>
+      ` : ""}
+
+      <div class="drawer-section-label">APP & SHARING</div>
+
+      <button class="drawer-item" onclick="closeSideDrawer();openInstallPopup()">
+        <span class="drawer-item-icon icon-green">📲</span>
+        <span class="drawer-item-text">
+          <b>Install / Download App</b>
+          <small>${hasApk ? `Direct Android APK (${escapeHtml(remoteVer)})` : "Phone par 1-Tap App install karein"}</small>
+        </span>
+        <span class="drawer-item-badge badge-green">${hasApk ? "APK" : "Free"}</span>
+      </button>
+
+      <button class="drawer-item" onclick="closeSideDrawer();openShareModal()">
+        <span class="drawer-item-icon icon-emerald">📤</span>
+        <span class="drawer-item-text">
+          <b>Share HD IPO Live</b>
+          <small>Fayde & Features ke saath doston ko bhejein</small>
+        </span>
+        <span class="drawer-chevron">›</span>
+      </button>
+
+      <button class="drawer-item" onclick="closeSideDrawer();checkForUpdatesManual()">
+        <span class="drawer-item-icon icon-indigo">🔄</span>
+        <span class="drawer-item-text">
+          <b>Check App Update</b>
+          <small>Installed: ${escapeHtml(localVer)} • Latest: ${escapeHtml(remoteVer)}</small>
+        </span>
+        ${hasUpdate ? `<span class="drawer-item-badge badge-red">NEW</span>` : `<span class="drawer-chevron">›</span>`}
+      </button>
+
+      <div class="drawer-section-label">PREFERENCES & TOOLS</div>
+
+      <button class="drawer-item" onclick="closeSideDrawer();openSettingsModal()">
+        <span class="drawer-item-icon icon-slate">⚙️</span>
+        <span class="drawer-item-text">
+          <b>Settings</b>
+          <small>Default IPO tab, Registrar & cache</small>
+        </span>
+        <span class="drawer-chevron">›</span>
+      </button>
+
+      <button class="drawer-item" onclick="closeSideDrawer();syncLiveData(true)">
+        <span class="drawer-item-icon icon-sky">↻</span>
+        <span class="drawer-item-text">
+          <b>Sync Live IPO Data</b>
+          <small>Latest GMP, subscription & prices</small>
+        </span>
+        <span class="drawer-chevron">›</span>
+      </button>
+
+      ${isLogged ? `
+        <div class="drawer-divider"></div>
+        <button class="drawer-item drawer-item-danger" onclick="closeSideDrawer();handleLogout()">
+          <span class="drawer-item-icon icon-red">🚪</span>
+          <span class="drawer-item-text">
+            <b>Logout</b>
+            <small>Is device se sign out karein</small>
+          </span>
+          <span class="drawer-chevron">›</span>
+        </button>
+      ` : ""}
+    </div>
+
+    <div class="drawer-footer">
+      <div><b>HD IPO Live</b> • ${escapeHtml(remoteVer)}</div>
+      <small>Mainboard • SME • RHP Financials • Allotment</small>
+    </div>
+  `;
+}
+
+function openSideDrawer() {
+  if (!sideDrawerOverlay || !sideDrawer) return;
+  renderSideDrawer();
+  sideDrawerOverlay.classList.remove("hidden");
+  requestAnimationFrame(() => {
+    sideDrawerOverlay.classList.add("open");
+  });
+}
+
+function closeSideDrawer() {
+  if (!sideDrawerOverlay) return;
+  sideDrawerOverlay.classList.remove("open");
+  setTimeout(() => {
+    if (!sideDrawerOverlay.classList.contains("open")) {
+      sideDrawerOverlay.classList.add("hidden");
+    }
+  }, 220);
+}
+
+function refreshOpenDrawer() {
+  if (sideDrawerOverlay && !sideDrawerOverlay.classList.contains("hidden")) {
+    renderSideDrawer();
+  }
+}
+
+document.addEventListener("keydown", (e) => {
+  if (e.key === "Escape") {
+    closeSideDrawer();
+    closePopupOverlay();
+  }
+});
+
+async function checkForUpdatesManual() {
+  showNotice("🔄 Latest update check ho raha hai...");
+  try {
+    if (window.hdAuth && typeof window.hdAuth.loadAppConfig === "function") {
+      await window.hdAuth.loadAppConfig();
+    }
+  } catch (_) {}
+  const cfg = getAppConfigSafe();
+  const remoteVer = cfg.appVersion || "v1.0";
+  const localVer = getLocalAppVersion(remoteVer);
+  if (compareAppVersions(remoteVer, localVer) > 0) {
+    openUpdatePopup(false);
+  } else {
+    showNotice(`✅ Aapka HD IPO App bilkul latest version (${remoteVer}) par hai!`);
+  }
+}
+
+function saveAppSetting(key, value) {
+  appSettings[key] = value;
+  try { localStorage.setItem("hdAppSettings", JSON.stringify(appSettings)); } catch (_) {}
+
+  if (key === "defaultCategory") {
+    currentCategory = value;
+    chips.forEach((c) => c.classList.toggle("active", (c.dataset.category || "all") === value));
+    if (currentPage === "home") renderIPOs();
+  } else if (key === "defaultTab") {
+    currentTab = value;
+    tabs.forEach((t) => t.classList.toggle("active", (t.dataset.tab || "live") === value));
+    if (currentPage === "home") renderIPOs();
+  } else if (key === "defaultRegistrar") {
+    selectedRegistrar = value;
+    if (currentPage === "allotment") renderAllotmentPage();
+  }
+  showNotice("✅ Setting save ho gayi!");
+}
+
+async function clearAppCacheAndReload() {
+  try { localStorage.removeItem("hdRemoteIPOs"); } catch (_) {}
+  try {
+    if ("caches" in window) {
+      const keys = await caches.keys();
+      await Promise.all(keys.map(k => caches.delete(k)));
+    }
+  } catch (_) {}
+  showNotice("🧹 Cache clear ho gaya! Fresh live data load ho raha hai...");
+  closeAnalysis();
+  await syncLiveData(true);
+}
+
+function openSettingsModal() {
+  const cfg = getAppConfigSafe();
+  const remoteVer = cfg.appVersion || "v1.0";
+  const localVer = getLocalAppVersion(remoteVer);
+
+  analysisModal.innerHTML = `
+    <div class="modal-header">
+      <button class="back-btn" onclick="closeAnalysis()">← Back</button>
+      <div class="modal-title">⚙️ App Settings</div>
+      <span style="width:48px;"></span>
+    </div>
+    <div class="modal-body">
+      <div class="section-card">
+        <div class="section-heading">🏠 Home Screen Preferences</div>
+
+        <div class="form-field">
+          <label>Default IPO Category</label>
+          <select onchange="saveAppSetting('defaultCategory', this.value)">
+            <option value="all" ${appSettings.defaultCategory === "all" ? "selected" : ""}>All IPOs (Mainboard + SME)</option>
+            <option value="mainboard" ${appSettings.defaultCategory === "mainboard" ? "selected" : ""}>Mainboard Only</option>
+            <option value="sme" ${appSettings.defaultCategory === "sme" ? "selected" : ""}>SME IPO Only</option>
+          </select>
+        </div>
+
+        <div class="form-field" style="margin-bottom:0;">
+          <label>Default Home Tab</label>
+          <select onchange="saveAppSetting('defaultTab', this.value)">
+            <option value="live" ${appSettings.defaultTab === "live" ? "selected" : ""}>Live IPOs</option>
+            <option value="upcoming" ${appSettings.defaultTab === "upcoming" ? "selected" : ""}>Upcoming IPOs</option>
+            <option value="closed" ${appSettings.defaultTab === "closed" ? "selected" : ""}>Closed / Listed IPOs</option>
+          </select>
+        </div>
+      </div>
+
+      <div class="section-card">
+        <div class="section-heading">👨‍👩‍👧‍👦 Allotment & Popup Preferences</div>
+
+        <div class="form-field">
+          <label>Default Allotment Registrar</label>
+          <select onchange="saveAppSetting('defaultRegistrar', this.value)">
+            <option value="https://in.mpms.mufg.com/Initial_Offer/public-issues.html" ${appSettings.defaultRegistrar.includes("mufg") ? "selected" : ""}>MUFG Intime (Link Intime)</option>
+            <option value="https://ipostatus.kfintech.com/" ${appSettings.defaultRegistrar.includes("kfintech") ? "selected" : ""}>KFintech Registrar</option>
+            <option value="https://www.bigshareonline.com/ipo_Allotment.html" ${appSettings.defaultRegistrar.includes("bigshare") ? "selected" : ""}>Bigshare Services</option>
+            <option value="https://www.bseindia.com/investors/appli_check.aspx" ${appSettings.defaultRegistrar.includes("bseindia") ? "selected" : ""}>BSE India IPO Status</option>
+            <option value="https://www.nseindia.com/products/dynaContent/equities/ipos/ipo_login.jsp" ${appSettings.defaultRegistrar.includes("nseindia") ? "selected" : ""}>NSE India IPO Status</option>
+          </select>
+        </div>
+
+        <div class="settings-toggle-row">
+          <div>
+            <b>Browser mein Auto Install Popup</b>
+            <small>Web browser mein kholne par Install popup dikhayein</small>
+          </div>
+          <label class="hd-switch">
+            <input type="checkbox" ${appSettings.autoInstallPopup ? "checked" : ""} onchange="saveAppSetting('autoInstallPopup', this.checked)">
+            <span class="hd-slider"></span>
+          </label>
+        </div>
+      </div>
+
+      <div class="section-card">
+        <div class="section-heading">📦 App Version & Data</div>
+        <div class="kv-row"><span class="kv-label">Installed Version</span><span class="kv-val">${escapeHtml(localVer)}</span></div>
+        <div class="kv-row"><span class="kv-label">Latest Live Version</span><span class="kv-val" style="color:#15803d;">${escapeHtml(remoteVer)}</span></div>
+        <div class="kv-row" style="border:none;"><span class="kv-label">Saved Watchlist / PANs</span><span class="kv-val">${savedIds.length} IPOs • ${familyPans.length} PANs</span></div>
+
+        <div style="display:flex;gap:8px;margin-top:10px;">
+          <button class="btn-primary-full" style="margin:0;flex:1;background:#1d4ed8;" onclick="checkForUpdatesManual()">🔄 Check Update</button>
+          <button class="btn-primary-full" style="margin:0;flex:1;background:#475569;" onclick="clearAppCacheAndReload()">🧹 Refresh Cache</button>
+        </div>
+      </div>
+
+      <div class="section-card">
+        <div class="section-heading">ℹ️ About HD IPO Live</div>
+        <p class="about-text" style="margin-bottom:10px;">
+          HD IPO Live aapko Mainboard & SME IPO ka real-time GMP, 3–4 saal ka RHP financial data, Company vs Market Demand analysis aur 1-Click Family PAN Allotment status deta hai.
+        </p>
+        <div style="display:flex;gap:8px;">
+          <button class="btn-primary-full" style="margin:0;flex:1;background:#15803d;" onclick="openShareModal()">📤 Share App</button>
+          <button class="btn-primary-full" style="margin:0;flex:1;background:#0f172a;" onclick="openInstallPopup()">📲 Install / APK</button>
+        </div>
+      </div>
+
+      <p class="disclaimer">Educational & informational purpose only. Always verify RHP and consult a SEBI-registered advisor before investing.</p>
+    </div>
+  `;
+  analysisModal.classList.remove("hidden");
+  analysisModal.scrollTop = 0;
+}
+
 window.addEventListener("hd-auth-changed", () => {
   updateAuthHeaderUI();
+  refreshOpenDrawer();
+  if (currentPage === "home") renderIPOs();
   if (activeAnalysisIpoId && !analysisModal.classList.contains("hidden")) {
     const ipo = getAllIPOs().find(item => String(item.id) === String(activeAnalysisIpoId));
     if (ipo) openAnalysis(ipo.id);
   }
 });
 
-// INITIAL RENDER + AUTO LIVE SYNC
+// APPLY SAVED DEFAULT CATEGORY & TAB CHIPS + INITIAL RENDER + AUTO LIVE SYNC
+chips.forEach((c) => c.classList.toggle("active", (c.dataset.category || "all") === currentCategory));
+tabs.forEach((t) => t.classList.toggle("active", (t.dataset.tab || "live") === currentTab));
 updateAuthHeaderUI();
 renderCurrentPage();
 syncLiveData(false);
+if (window.hdAuth && window.hdAuth.appConfig && window.hdAuth.appConfig.loaded) {
+  checkStartupPopups();
+} else {
+  // Fallback if Firestore config takes longer than 2s (e.g., offline)
+  setTimeout(() => { checkStartupPopups(); }, 2200);
+}
 

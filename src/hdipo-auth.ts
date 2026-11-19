@@ -168,6 +168,7 @@ interface HdAuthBridge {
   ready: boolean;
   user: User | null;
   profile: HdUserProfile | null;
+  appConfig: { apkUrl: string; appVersion: string; updateNotes: string; loaded: boolean };
   isAdmin: () => boolean;
   isLoggedIn: () => boolean;
   needsMobileRegistration: () => boolean;
@@ -180,6 +181,8 @@ interface HdAuthBridge {
   loadFamilyPans: () => Promise<FamilyPanEntry[]>;
   syncFamilyPanAdd: (memberName: string, panNumber: string) => Promise<string | null>;
   syncFamilyPanDelete: (panDocId: string) => Promise<void>;
+  loadAppConfig: () => Promise<{ apkUrl: string; appVersion: string; updateNotes: string; loaded: boolean }>;
+  saveAppConfig: (apkUrl: string, appVersion: string, updateNotes?: string) => Promise<{ apkUrl: string; appVersion: string; updateNotes: string; loaded: boolean }>;
   fetchAdminDashboard: () => Promise<{
     users: HdUserProfile[];
     activities: HdActivityItem[];
@@ -235,6 +238,7 @@ const hdAuth: HdAuthBridge = {
   ready: false,
   user: null,
   profile: null,
+  appConfig: { apkUrl: '', appVersion: 'v1.0', updateNotes: '', loaded: false },
 
   isAdmin() {
     return Boolean(
@@ -468,6 +472,65 @@ const hdAuth: HdAuthBridge = {
     }
   },
 
+  async loadAppConfig() {
+    const path = 'hd_config/app';
+    try {
+      let snap;
+      try {
+        snap = await getDocFromServer(doc(db, 'hd_config', 'app'));
+      } catch (_) {
+        snap = await getDoc(doc(db, 'hd_config', 'app'));
+      }
+      if (snap.exists()) {
+        const d = snap.data();
+        this.appConfig = {
+          apkUrl: String(d.apkUrl || '').slice(0, 500),
+          appVersion: String(d.appVersion || 'v1.0').slice(0, 30),
+          updateNotes: String(d.updateNotes || '').slice(0, 240),
+          loaded: true,
+        };
+      } else {
+        this.appConfig = {
+          ...this.appConfig,
+          loaded: true,
+        };
+      }
+      window.dispatchEvent(new CustomEvent('hd-config-loaded', { detail: this.appConfig }));
+      return this.appConfig;
+    } catch (err) {
+      this.appConfig = { ...this.appConfig, loaded: true };
+      window.dispatchEvent(new CustomEvent('hd-config-loaded', { detail: this.appConfig }));
+      handleFirestoreError(err, OperationType.GET, path);
+    }
+  },
+
+  async saveAppConfig(rawApkUrl: string, rawVersion: string, rawNotes = '') {
+    if (!this.isAdmin()) {
+      throw new Error('Sirf Admin APK link aur version update kar sakte hain.');
+    }
+    const cleanUrl = String(rawApkUrl || '').trim().slice(0, 500);
+    const cleanVersion = String(rawVersion || 'v1.0').trim().slice(0, 30) || 'v1.0';
+    const cleanNotes = String(rawNotes || '').trim().slice(0, 240);
+    if (cleanUrl && !/^https:\/\/.+/i.test(cleanUrl)) {
+      throw new Error('APK Link https:// se shuru hona chahiye (e.g. GitHub Release ya Google Drive link).');
+    }
+    const path = 'hd_config/app';
+    try {
+      await setDoc(doc(db, 'hd_config', 'app'), {
+        apkUrl: cleanUrl,
+        appVersion: cleanVersion,
+        updateNotes: cleanNotes,
+        updatedAt: serverTimestamp(),
+      });
+      this.appConfig = { apkUrl: cleanUrl, appVersion: cleanVersion, updateNotes: cleanNotes, loaded: true };
+      notifyAuthChange();
+      window.dispatchEvent(new CustomEvent('hd-config-loaded', { detail: this.appConfig }));
+      return this.appConfig;
+    } catch (err) {
+      handleFirestoreError(err, OperationType.WRITE, path);
+    }
+  },
+
   async fetchAdminDashboard() {
     if (!this.isAdmin()) {
       throw new Error('Sirf Admin is dashboard ko dekh sakte hain.');
@@ -535,6 +598,8 @@ onAuthStateChanged(auth, async (user) => {
   hdAuth.ready = true;
   notifyAuthChange();
 });
+
+void hdAuth.loadAppConfig().then(() => notifyAuthChange()).catch(() => {});
 
 declare global {
   interface Window {

@@ -187,6 +187,36 @@
         }
       },
       "required": ["uid", "email", "createdAt"]
+    },
+    "HdAppConfig": {
+      "title": "HD IPO App Distribution Config",
+      "description": "Public non-PII distribution metadata such as direct Android APK download URL, latest app version, and update notes.",
+      "type": "object",
+      "properties": {
+        "apkUrl": {
+          "type": "string",
+          "description": "Direct HTTPS link to the latest signed Android APK release.",
+          "maxLength": 500,
+          "pattern": "^(|https://.*)$"
+        },
+        "appVersion": {
+          "type": "string",
+          "description": "Human-readable version label such as v1.0 or v1.1.",
+          "minLength": 1,
+          "maxLength": 30
+        },
+        "updateNotes": {
+          "type": "string",
+          "description": "Short changelog shown inside the app update popup.",
+          "maxLength": 240
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp when config was last updated."
+        }
+      },
+      "required": ["apkUrl", "appVersion", "updateNotes", "updatedAt"]
     }
   },
   "firestore": {
@@ -205,6 +235,10 @@
     "/admins/{adminId}": {
       "schema": { "$ref": "#/entities/AdminRecord" },
       "description": "Admin RBAC records managed strictly by bootstrap admin."
+    },
+    "/hd_config/{configId}": {
+      "schema": { "$ref": "#/entities/HdAppConfig" },
+      "description": "Publicly readable app install/APK link configuration writable only by admin."
     }
   }
 }
