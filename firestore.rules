@@ -25,23 +25,36 @@ service cloud.firestore {
       return request.auth != null;
     }
 
+    function isPhoneVerified() {
+      return isSignedIn()
+        && ('phone_number' in request.auth.token)
+        && request.auth.token.phone_number is string
+        && request.auth.token.phone_number.matches('^\\+91[6-9][0-9]{9}$');
+    }
+
+    function isEmailVerified() {
+      return isSignedIn()
+        && ('email_verified' in request.auth.token)
+        && request.auth.token.email_verified == true;
+    }
+
     function isVerifiedUser() {
-      return isSignedIn() && request.auth.token.email_verified == true;
+      return isPhoneVerified() || isEmailVerified();
     }
 
     function isOwner(userId) {
       return isVerifiedUser() && request.auth.uid == userId;
     }
 
-    // Zero-read bootstrap admin check (safe for allow list queries)
+    // Zero-read bootstrap admin check (strictly requires verified admin email — safe for allow list queries)
     function isBootstrapAdmin() {
-      return isVerifiedUser() && request.auth.token.email == 'prajapatih000@gmail.com';
+      return isEmailVerified() && request.auth.token.email == 'prajapatih000@gmail.com';
     }
 
     // Full admin check for single-document operations
     function isAdmin() {
       return isBootstrapAdmin() || (
-        isVerifiedUser() && exists(/databases/$(database)/documents/admins/$(request.auth.uid))
+        isEmailVerified() && exists(/databases/$(database)/documents/admins/$(request.auth.uid))
       );
     }
 
@@ -117,7 +130,10 @@ service cloud.firestore {
         && isValidId(userId)
         && isOwner(userId)
         && isValidHdUser(incoming(), userId)
-        && incoming().email == request.auth.token.email
+        && (
+          (isPhoneVerified() && incoming().email == '' && ('+91' + incoming().mobile) == request.auth.token.phone_number)
+          || (isEmailVerified() && incoming().email == request.auth.token.email)
+        )
         && incoming().createdAt == request.time
         && incoming().lastActiveAt == request.time
         && incoming().loginCount == 1
@@ -130,6 +146,7 @@ service cloud.firestore {
         && incoming().email == existing().email
         && incoming().createdAt == existing().createdAt
         && incoming().lastActiveAt == request.time
+        && (!isPhoneVerified() || ('+91' + incoming().mobile) == request.auth.token.phone_number)
         && (
           isAdmin()
           || (
@@ -218,7 +235,7 @@ service cloud.firestore {
 
     // === 4. ADMIN ALLOWLIST ===
     match /admins/{adminId} {
-      allow get: if isVerifiedUser() && isValidId(adminId) && (isBootstrapAdmin() || request.auth.uid == adminId);
+      allow get: if isEmailVerified() && isValidId(adminId) && (isBootstrapAdmin() || request.auth.uid == adminId);
       allow list: if isBootstrapAdmin();
       allow create: if isBootstrapAdmin()
         && isValidId(adminId)

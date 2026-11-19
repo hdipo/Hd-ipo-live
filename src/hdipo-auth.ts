@@ -3,8 +3,11 @@ import {
   getAuth,
   GoogleAuthProvider,
   onAuthStateChanged,
+  RecaptchaVerifier,
+  signInWithPhoneNumber,
   signInWithPopup,
   signOut,
+  type ConfirmationResult,
   type User,
 } from 'firebase/auth';
 import {
@@ -29,6 +32,7 @@ import firebaseConfig from '../firebase-applet-config.json';
 
 const ADMIN_EMAIL = 'prajapatih000@gmail.com';
 const MOBILE_REGEX = /^[6-9][0-9]{9}$/;
+const OTP_REGEX = /^[0-9]{6}$/;
 const PAN_REGEX = /^[A-Z]{5}[0-9]{4}[A-Z]{1}$/;
 
 enum OperationType {
@@ -47,6 +51,7 @@ interface FirestoreErrorInfo {
   authInfo: {
     userId?: string | null;
     email?: string | null;
+    phoneNumber?: string | null;
     emailVerified?: boolean | null;
     isAnonymous?: boolean | null;
     tenantId?: string | null;
@@ -92,8 +97,114 @@ export interface FamilyPanEntry {
 const app = initializeApp(firebaseConfig);
 export const db = getFirestore(app, firebaseConfig.firestoreDatabaseId);
 export const auth = getAuth(app);
+auth.languageCode = 'en';
+
 const googleProvider = new GoogleAuthProvider();
 googleProvider.setCustomParameters({ prompt: 'select_account' });
+
+let recaptchaVerifier: RecaptchaVerifier | null = null;
+let pendingConfirmation: ConfirmationResult | null = null;
+let pendingMobile10 = '';
+
+function ensureRecaptchaContainer(): HTMLElement {
+  let el = document.getElementById('hd-recaptcha-container');
+  if (!el) {
+    el = document.createElement('div');
+    el.id = 'hd-recaptcha-container';
+    el.style.position = 'fixed';
+    el.style.bottom = '0';
+    el.style.left = '0';
+    el.style.zIndex = '99999';
+    document.body.appendChild(el);
+  }
+  return el;
+}
+
+function clearRecaptcha() {
+  if (recaptchaVerifier) {
+    try {
+      recaptchaVerifier.clear();
+    } catch (_) {
+      // ignore cleanup error
+    }
+    recaptchaVerifier = null;
+  }
+  const el = document.getElementById('hd-recaptcha-container');
+  if (el) el.innerHTML = '';
+}
+
+function extractIndianMobile(phone: string | null | undefined): string {
+  const digits = String(phone || '').replace(/\D/g, '');
+  if (digits.length >= 10) {
+    const last10 = digits.slice(-10);
+    if (MOBILE_REGEX.test(last10)) return last10;
+  }
+  return '';
+}
+
+function mapPhoneAuthError(err: unknown): { code: string; message: string } {
+  const code =
+    typeof err === 'object' && err !== null && 'code' in err
+      ? String((err as { code?: unknown }).code || '')
+      : '';
+  const rawMsg = err instanceof Error ? err.message : String(err || '');
+
+  if (code === 'auth/operation-not-allowed' || rawMsg.includes('OPERATION_NOT_ALLOWED')) {
+    return {
+      code,
+      message:
+        'Firebase Console mein Phone (Mobile OTP) Sign-in abhi ON nahi hai. Firebase Console → Authentication → Sign-in method → Phone ko Enable karein.',
+    };
+  }
+  if (code === 'auth/billing-not-enabled' || rawMsg.includes('BILLING_NOT_ENABLED')) {
+    return {
+      code,
+      message:
+        'Firebase Phone SMS OTP ke liye Firebase Console mein Phone provider enable (aur test numbers ya Blaze SMS plan) set karna zaroori hai.',
+    };
+  }
+  if (code === 'auth/unauthorized-domain') {
+    return {
+      code,
+      message:
+        'Is app ka domain Firebase Authorized Domains mein add nahi hai. Firebase Console → Authentication → Settings → Authorized domains mein add karein.',
+    };
+  }
+  if (code === 'auth/invalid-phone-number') {
+    return {
+      code,
+      message: 'Sahi 10-digit Indian mobile number daalein (6, 7, 8 ya 9 se shuru).',
+    };
+  }
+  if (code === 'auth/too-many-requests') {
+    return {
+      code,
+      message: 'Bahut zyada OTP attempts ho gaye hain. 2–5 minute baad dobara try karein.',
+    };
+  }
+  if (code === 'auth/invalid-verification-code') {
+    return {
+      code,
+      message: 'Galat OTP code! SMS mein aaya hua sahi 6-digit OTP daalein.',
+    };
+  }
+  if (code === 'auth/code-expired') {
+    return {
+      code,
+      message: 'OTP expire ho gaya hai. Resend OTP par click karke naya OTP mangwayein.',
+    };
+  }
+  if (code === 'auth/captcha-check-failed' || code === 'auth/missing-client-identifier') {
+    return {
+      code,
+      message: 'Security verification fail hui — page refresh karke dobara Send OTP dabayein.',
+    };
+  }
+  return {
+    code,
+    message: rawMsg || 'OTP bhejne mein dikkat aayi, kripya dobara try karein.',
+  };
+}
 
 function handleFirestoreError(
   error: unknown,
@@ -105,6 +216,7 @@ function handleFirestoreError(
     authInfo: {
       userId: auth.currentUser?.uid,
       email: auth.currentUser?.email,
+      phoneNumber: auth.currentUser?.phoneNumber,
       emailVerified: auth.currentUser?.emailVerified,
       isAnonymous: auth.currentUser?.isAnonymous,
       tenantId: auth.currentUser?.tenantId,
@@ -171,10 +283,20 @@ interface HdAuthBridge {
   appConfig: { apkUrl: string; appVersion: string; updateNotes: string; loaded: boolean };
   isAdmin: () => boolean;
   isLoggedIn: () => boolean;
+  isPhoneUser: () => boolean;
   needsMobileRegistration: () => boolean;
   hasAdvanceAccess: () => boolean;
+  sendMobileOtp: (
+    rawMobile: string
+  ) => Promise<{ ok: boolean; mobile10?: string; phoneE164?: string; error?: string; errorCode?: string }>;
+  verifyMobileOtp: (
+    otpCode: string,
+    rawName?: string,
+    localSavedIds?: string[]
+  ) => Promise<{ status: 'complete' | 'needs_name' | 'error'; error?: string }>;
+  resetOtpState: () => void;
   signInWithGoogle: () => Promise<{ status: 'complete' | 'needs_mobile' | 'cancelled'; error?: string }>;
-  completeMobileProfile: (name: string, mobile: string, localSavedIds?: string[]) => Promise<HdUserProfile>;
+  completeMobileProfile: (name: string, mobile?: string, localSavedIds?: string[]) => Promise<HdUserProfile>;
   signOutUser: () => Promise<void>;
   logIpoAdvanceView: (ipoName: string, category: string) => Promise<void>;
   syncSavedIds: (ids: string[]) => Promise<void>;
@@ -182,7 +304,11 @@ interface HdAuthBridge {
   syncFamilyPanAdd: (memberName: string, panNumber: string) => Promise<string | null>;
   syncFamilyPanDelete: (panDocId: string) => Promise<void>;
   loadAppConfig: () => Promise<{ apkUrl: string; appVersion: string; updateNotes: string; loaded: boolean }>;
-  saveAppConfig: (apkUrl: string, appVersion: string, updateNotes?: string) => Promise<{ apkUrl: string; appVersion: string; updateNotes: string; loaded: boolean }>;
+  saveAppConfig: (
+    apkUrl: string,
+    appVersion: string,
+    updateNotes?: string
+  ) => Promise<{ apkUrl: string; appVersion: string; updateNotes: string; loaded: boolean }>;
   fetchAdminDashboard: () => Promise<{
     users: HdUserProfile[];
     activities: HdActivityItem[];
@@ -248,17 +374,122 @@ const hdAuth: HdAuthBridge = {
     );
   },
 
+  isPhoneUser() {
+    return Boolean(this.user && extractIndianMobile(this.user.phoneNumber));
+  },
+
   isLoggedIn() {
-    return Boolean(this.user && this.user.emailVerified);
+    return Boolean(this.user && (extractIndianMobile(this.user.phoneNumber) || this.user.emailVerified));
   },
 
   needsMobileRegistration() {
-    return Boolean(this.isLoggedIn() && (!this.profile || !MOBILE_REGEX.test(this.profile.mobile || '')));
+    return Boolean(
+      this.isLoggedIn() &&
+        (!this.profile ||
+          !MOBILE_REGEX.test(this.profile.mobile || '') ||
+          String(this.profile.name || '').trim().length < 2)
+    );
   },
 
   hasAdvanceAccess() {
     if (this.isAdmin()) return true;
-    return Boolean(this.isLoggedIn() && this.profile && MOBILE_REGEX.test(this.profile.mobile || ''));
+    return Boolean(
+      this.isLoggedIn() &&
+        this.profile &&
+        MOBILE_REGEX.test(this.profile.mobile || '') &&
+        String(this.profile.name || '').trim().length >= 2
+    );
+  },
+
+  resetOtpState() {
+    pendingConfirmation = null;
+    pendingMobile10 = '';
+    clearRecaptcha();
+  },
+
+  async sendMobileOtp(rawMobile: string) {
+    const cleanMobile = String(rawMobile || '').replace(/\D/g, '').slice(-10);
+    if (!MOBILE_REGEX.test(cleanMobile)) {
+      return {
+        ok: false,
+        error: 'Sahi 10-digit Indian mobile number daalein (6, 7, 8 ya 9 se shuru).',
+      };
+    }
+
+    const phoneE164 = `+91${cleanMobile}`;
+    try {
+      clearRecaptcha();
+      const container = ensureRecaptchaContainer();
+      recaptchaVerifier = new RecaptchaVerifier(auth, container, {
+        size: 'invisible',
+        callback: () => {},
+        'expired-callback': () => {
+          clearRecaptcha();
+        },
+      });
+      await recaptchaVerifier.render();
+      pendingConfirmation = await signInWithPhoneNumber(auth, phoneE164, recaptchaVerifier);
+      pendingMobile10 = cleanMobile;
+      return { ok: true, mobile10: cleanMobile, phoneE164 };
+    } catch (err) {
+      clearRecaptcha();
+      pendingConfirmation = null;
+      const mapped = mapPhoneAuthError(err);
+      console.error('Mobile OTP send error:', err);
+      return { ok: false, error: mapped.message, errorCode: mapped.code };
+    }
+  },
+
+  async verifyMobileOtp(otpCode: string, rawName = '', localSavedIds: string[] = []) {
+    const cleanOtp = String(otpCode || '').replace(/\D/g, '').trim();
+    if (!OTP_REGEX.test(cleanOtp)) {
+      return { status: 'error', error: '6-digit OTP code sahi se daalein.' };
+    }
+    if (!pendingConfirmation) {
+      return { status: 'error', error: 'OTP session expire ho gaya — kripya dobara Send OTP dabayein.' };
+    }
+
+    try {
+      const cred = await pendingConfirmation.confirm(cleanOtp);
+      this.user = cred.user;
+      pendingConfirmation = null;
+      clearRecaptcha();
+
+      const verifiedMobile = extractIndianMobile(cred.user.phoneNumber) || pendingMobile10;
+      const existing = await fetchUserProfile(cred.user.uid);
+
+      if (existing && MOBILE_REGEX.test(existing.mobile || '') && String(existing.name || '').trim().length >= 2) {
+        this.profile = existing;
+        const path = `hd_users/${cred.user.uid}`;
+        try {
+          await updateDoc(doc(db, 'hd_users', cred.user.uid), {
+            loginCount: increment(1),
+            platform: detectPlatform().slice(0, 40),
+            lastActiveAt: serverTimestamp(),
+          });
+          this.profile.loginCount = (this.profile.loginCount || 0) + 1;
+        } catch (err) {
+          handleFirestoreError(err, OperationType.UPDATE, path);
+        }
+        await recordActivity(this.profile, 'Mobile OTP Login', 'app', 'login').catch(() => {});
+        notifyAuthChange();
+        return { status: 'complete' };
+      }
+
+      const cleanName = String(rawName || '').trim().slice(0, 80);
+      if (cleanName.length >= 2 && MOBILE_REGEX.test(verifiedMobile)) {
+        await this.completeMobileProfile(cleanName, verifiedMobile, localSavedIds);
+        return { status: 'complete' };
+      }
+
+      this.profile = existing;
+      notifyAuthChange();
+      return { status: 'needs_name' };
+    } catch (err) {
+      const mapped = mapPhoneAuthError(err);
+      console.error('Mobile OTP verify error:', err);
+      return { status: 'error', error: mapped.message };
+    }
   },
 
   async signInWithGoogle() {
@@ -285,23 +516,27 @@ const hdAuth: HdAuthBridge = {
       }
       this.profile = existing;
       notifyAuthChange();
-      return { status: 'needs_mobile' };
+      return { status: this.isAdmin() ? 'complete' : 'needs_mobile' };
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       if (msg.includes('popup-closed-by-user') || msg.includes('cancelled-popup-request')) {
         return { status: 'cancelled' };
       }
-      console.error('Google Sign-In error:', err);
+      console.error('Admin Sign-In error:', err);
       return { status: 'cancelled', error: msg };
     }
   },
 
-  async completeMobileProfile(rawName: string, rawMobile: string, localSavedIds: string[] = []) {
-    if (!auth.currentUser || !auth.currentUser.emailVerified) {
-      throw new Error('Pehle Google se sign in karein.');
+  async completeMobileProfile(rawName: string, rawMobile = '', localSavedIds: string[] = []) {
+    const currentUser = auth.currentUser;
+    const phoneMobile = extractIndianMobile(currentUser?.phoneNumber);
+    const isVerified = Boolean(currentUser && (phoneMobile || currentUser.emailVerified));
+    if (!currentUser || !isVerified) {
+      throw new Error('Pehle Mobile OTP verify karein.');
     }
+
     const cleanName = String(rawName || '').trim().slice(0, 80);
-    const cleanMobile = String(rawMobile || '').replace(/\D/g, '').slice(-10);
+    const cleanMobile = phoneMobile || String(rawMobile || '').replace(/\D/g, '').slice(-10);
     if (cleanName.length < 2) {
       throw new Error('Apna sahi naam (kam se kam 2 akshar) likhein.');
     }
@@ -309,7 +544,7 @@ const hdAuth: HdAuthBridge = {
       throw new Error('Sahi 10-digit Indian mobile number daalein (6, 7, 8 ya 9 se shuru).');
     }
 
-    const uid = auth.currentUser.uid;
+    const uid = currentUser.uid;
     const path = `hd_users/${uid}`;
     const existing = await fetchUserProfile(uid);
     const platform = detectPlatform().slice(0, 40);
@@ -319,7 +554,7 @@ const hdAuth: HdAuthBridge = {
         await updateDoc(doc(db, 'hd_users', uid), {
           name: cleanName,
           mobile: cleanMobile,
-          photoUrl: String(auth.currentUser.photoURL || '').slice(0, 500),
+          photoUrl: String(currentUser.photoURL || '').slice(0, 500),
           platform,
           lastActiveAt: serverTimestamp(),
         });
@@ -342,8 +577,8 @@ const hdAuth: HdAuthBridge = {
       uid,
       name: cleanName,
       mobile: cleanMobile,
-      email: String(auth.currentUser.email || '').slice(0, 150),
-      photoUrl: String(auth.currentUser.photoURL || '').slice(0, 500),
+      email: phoneMobile ? '' : String(currentUser.email || '').slice(0, 150),
+      photoUrl: String(currentUser.photoURL || '').slice(0, 500),
       platform,
       savedIds: sanitizeSavedIds(localSavedIds),
       viewsCount: 0,
@@ -362,12 +597,13 @@ const hdAuth: HdAuthBridge = {
     }
 
     this.profile = newProfile;
-    await recordActivity(newProfile, 'New Registration', 'app', 'login').catch(() => {});
+    await recordActivity(newProfile, 'New OTP Registration', 'app', 'login').catch(() => {});
     notifyAuthChange();
     return newProfile;
   },
 
   async signOutUser() {
+    this.resetOtpState();
     await signOut(auth);
     this.user = null;
     this.profile = null;
@@ -586,7 +822,7 @@ const hdAuth: HdAuthBridge = {
 
 onAuthStateChanged(auth, async (user) => {
   hdAuth.user = user;
-  if (user && user.emailVerified) {
+  if (user && (extractIndianMobile(user.phoneNumber) || user.emailVerified)) {
     try {
       hdAuth.profile = await fetchUserProfile(user.uid);
     } catch (_) {

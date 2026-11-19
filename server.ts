@@ -28,6 +28,9 @@ interface MergedLiveIpo {
   openDate: string;
   closeDate: string;
   listingDate: string;
+  openIso: string;
+  closeIso: string;
+  listingIso: string;
   priceBand: string;
   lotSize: number;
   minInvestment: string;
@@ -103,7 +106,8 @@ function extractHref(raw: unknown): string {
 function parseNumberOrNull(val: unknown): number | null {
   if (val === null || val === undefined || val === '') return null;
   if (typeof val === 'number') return Number.isFinite(val) ? val : null;
-  const cleaned = String(val).replace(/,/g, '').trim();
+  const cleaned = String(val).replace(/^(?:₹|rs\.?)\s*/i, '').replace(/,/g, '').trim();
+  if (!cleaned) return null;
   const num = Number(cleaned);
   return Number.isFinite(num) ? num : null;
 }
@@ -119,6 +123,21 @@ function formatMultiple(val: unknown): string {
   const num = parseNumberOrNull(val);
   if (num === null) return '—';
   return `${num.toFixed(2)}x`;
+}
+
+function toIsoDateOnly(raw: unknown): string {
+  if (!raw) return '';
+  const s = stripHtml(raw).trim();
+  if (!s) return '';
+  const isoMatch = s.match(/^(\d{4})-(\d{2})-(\d{2})/);
+  if (isoMatch) return `${isoMatch[1]}-${isoMatch[2]}-${isoMatch[3]}`;
+  const d = new Date(s);
+  if (Number.isNaN(d.getTime())) return '';
+  const y = d.getUTCFullYear();
+  if (y < 1990 || y > 2035) return '';
+  const m = String(d.getUTCMonth() + 1).padStart(2, '0');
+  const day = String(d.getUTCDate()).padStart(2, '0');
+  return `${y}-${m}-${day}`;
 }
 
 function formatIsoDateShort(iso: unknown, fallback: unknown): string {
@@ -257,6 +276,9 @@ async function getLiveChittorgarhFeed(forceRefresh = false): Promise<CachedFeed>
       row['~ListingDate'] || perf?.['~IPO_listing_date'],
       row['Listing Date'] || perf?.['Listing Date']
     );
+    const openIso = toIsoDateOnly(row['~Issue_Open_Date'] || row['Opening Date']);
+    const closeIso = toIsoDateOnly(row['~IssueCloseDate'] || row['Closing Date']);
+    const listingIso = toIsoDateOnly(row['~ListingDate'] || perf?.['~IPO_listing_date'] || row['Listing Date']);
 
     const issueCrRaw = stripHtml(row['Total Issue Amount (Incl.Firm reservations) (Rs.cr.)']);
     const issueSizeNum = parseNumberOrNull(issueCrRaw) ?? 0;
@@ -349,6 +371,9 @@ async function getLiveChittorgarhFeed(forceRefresh = false): Promise<CachedFeed>
       openDate,
       closeDate,
       listingDate,
+      openIso,
+      closeIso,
+      listingIso,
       priceBand: formatPriceBand(row['Issue Price (Rs.)']),
       lotSize: 0,
       minInvestment: '—',
@@ -433,9 +458,13 @@ interface CardMetaItem {
   normName: string;
   name: string;
   slug: string;
+  board: 'mainboard' | 'sme';
+  status: 'open' | 'upcoming' | 'closed' | 'listed';
   logoUrl: string;
   lotSize: number;
   issueSize: string;
+  issuePriceNum: number | null;
+  registrar: string;
   gmp: number;
   gmpPercent: number;
   subNum: number | null;
@@ -445,10 +474,66 @@ interface CardMetaItem {
   subAsOn: string;
   ofsPct: number | null;
   freshIssuePct: number | null;
+  listingOpenPrice: number | null;
+  listingOpenGainPct: number | null;
+  listingClosePrice: number | null;
+  listingCloseGainPct: number | null;
+  cmpPrice: number | null;
+  cmpGainPct: number | null;
   priceBand: string;
   openIso: string;
   closeIso: string;
+  listingIso: string;
   pe: number;
+  upcomingTier?: 'confirmed' | 'shareholder' | 'sebi_approved' | '';
+  sebiApprovalDate?: string;
+  drhpDate?: string;
+  shareholderParent?: string;
+}
+
+const SHAREHOLDER_PARENT_RULES: Array<{ re: RegExp; parent: string }> = [
+  { re: /\b(mahanadi|south eastern|eastern|western|central|northern|bharat coking)\s+coalfields?\b|\bcmpdi\b|\bcentral mine planning\b/i, parent: 'Coal India Ltd.' },
+  { re: /\bnlc india\b/i, parent: 'NLC India Ltd.' },
+  { re: /\bjsw\s+(one|cement|energy|infra)/i, parent: 'JSW Steel Ltd.' },
+  { re: /\bsbi\s+(funds|mutual|general|payment)/i, parent: 'State Bank of India (SBI)' },
+  { re: /\b(jio platforms|reliance jio|reliance retail)\b/i, parent: 'Reliance Industries Ltd.' },
+  { re: /\bhero\s+fincorp\b/i, parent: 'Hero MotoCorp Ltd.' },
+  { re: /\bcanara\s+(hsbc|robeco)\b/i, parent: 'Canara Bank' },
+  { re: /\bntpc\s+(green|renewable|vidyut)/i, parent: 'NTPC Ltd.' },
+  { re: /\bongc\s+(green|petro|videsh)/i, parent: 'ONGC Ltd.' },
+  { re: /\bhdfc\s+(credila|securities|ergo)\b/i, parent: 'HDFC Bank Ltd.' },
+  { re: /\bicici\s+(direct|prudential amc|ventures)\b/i, parent: 'ICICI Bank Ltd.' },
+  { re: /\btata\s+(capital|autocomp|play|passenger|electronics|digital)\b/i, parent: 'Tata Group (Check RHP Parent)' },
+  { re: /\bgreaves\s+electric\b/i, parent: 'Greaves Cotton Ltd.' },
+  { re: /\bprestige\s+hospitality\b/i, parent: 'Prestige Estates Projects' },
+  { re: /\bbrigade\s+hotel\b/i, parent: 'Brigade Enterprises Ltd.' },
+  { re: /\bsk\s+finance\b/i, parent: '' },
+];
+
+function detectShareholderParent(companyName: string): string {
+  const s = String(companyName || '').trim();
+  for (const rule of SHAREHOLDER_PARENT_RULES) {
+    if (rule.parent && rule.re.test(s)) return rule.parent;
+  }
+  return '';
+}
+
+function parseChittorgarhShortDateMs(raw: string): number {
+  const clean = stripHtml(raw).trim();
+  if (!clean) return 0;
+  const ts = Date.parse(clean);
+  return Number.isFinite(ts) ? ts : 0;
+}
+
+function cleanUpcomingIssueSize(raw: string): string {
+  const s = stripHtml(raw).replace(/&nbsp;/g, ' ').replace(/\s+/g, ' ').trim();
+  if (!s) return '';
+  const rsMatches = [...s.matchAll(/Rs\.?\s*([\d,]+(?:\.\d+)?)\s*cr/gi)];
+  if (rsMatches.length) {
+    const total = rsMatches.reduce((acc, m) => acc + (parseFloat(m[1].replace(/,/g, '')) || 0), 0);
+    if (total > 0) return `₹${Math.round(total).toLocaleString('en-IN')} Cr`;
+  }
+  return '';
 }
 
 let cachedCardsMeta: { fetchedAt: number; items: CardMetaItem[] } | null = null;
@@ -456,8 +541,13 @@ let cachedCardsMeta: { fetchedAt: number; items: CardMetaItem[] } | null = null;
 function normIpoKey(s: string): string {
   return String(s || '')
     .toLowerCase()
-    .replace(/\b(limited|ltd|private|pvt|india|indian|ipo|sme|industries|enterprises|technologies|services|solutions|corp|corporation|co)\b/g, ' ')
-    .replace(/[^a-z0-9]+/g, ' ')
+    .replace(/&/g, ' ')
+    .replace(/['’`]/g, '')
+    .replace(
+      /\b(and|the|of|for|limited|ltd|private|pvt|india|indian|ipo|sme|industries|industry|enterprises|enterprise|technologies|technology|tech|services|service|solutions|solution|corp|corporation|company|co|infra|infrastructure|engineering|engg)\b/g,
+      ' '
+    )
+    .replace(/[^a-z0-9]+/g, '')
     .trim();
 }
 
@@ -534,9 +624,13 @@ async function getHdIpoCardsMeta(forceRefresh = false): Promise<CardMetaItem[]> 
     return cachedCardsMeta.items;
   }
 
-  const [feedResult, gmpRows] = await Promise.all([
+  const { month, year, fy } = getIndianFyParams(new Date());
+  const baseUrl = 'https://webnodejs.chittorgarh.com/cloud/report/data-read';
+  const [feedResult, gmpRows, mainUpcomingRows, smeUpcomingRows] = await Promise.all([
     getLiveChittorgarhFeed(forceRefresh).catch(() => null),
     fetchInvestorGainGmpRows(),
+    fetchJsonSafe(`${baseUrl}/158/1/${month}/${year}/${fy}/0/all/0`),
+    fetchJsonSafe(`${baseUrl}/154/1/${month}/${year}/${fy}/0/all/0`),
   ]);
 
   const byKey = new Map<string, CardMetaItem>();
@@ -545,13 +639,18 @@ async function getHdIpoCardsMeta(forceRefresh = false): Promise<CardMetaItem[]> 
     for (const ipo of feedResult.allIpos) {
       const key = normIpoKey(ipo.companyName);
       if (!key) continue;
+      const shParent = detectShareholderParent(ipo.companyName);
       byKey.set(key, {
         normName: key,
         name: ipo.companyName,
         slug: ipo.slug,
+        board: ipo.board,
+        status: ipo.status,
         logoUrl: ipo.logoUrl || '',
         lotSize: ipo.lotSize || 0,
         issueSize: ipo.issueSize && ipo.issueSize !== 'TBA' ? ipo.issueSize : '',
+        issuePriceNum: ipo.issuePriceNum ?? null,
+        registrar: ipo.registrar || 'NSE / BSE',
         gmp: 0,
         gmpPercent: 0,
         subNum: ipo.subscriptionNum,
@@ -561,10 +660,19 @@ async function getHdIpoCardsMeta(forceRefresh = false): Promise<CardMetaItem[]> 
         subAsOn: ipo.subscriptionAsOn || '',
         ofsPct: ipo.ofsPct ?? null,
         freshIssuePct: ipo.freshIssuePct ?? null,
+        listingOpenPrice: ipo.listingOpenPrice ?? null,
+        listingOpenGainPct: ipo.listingOpenGainPct ?? null,
+        listingClosePrice: ipo.listingClosePrice ?? null,
+        listingCloseGainPct: ipo.listingCloseGainPct ?? null,
+        cmpPrice: parseNumberOrNull(ipo.currentMarketPrice),
+        cmpGainPct: ipo.currentGainPct ?? null,
         priceBand: ipo.priceBand && ipo.priceBand !== 'TBA' ? ipo.priceBand : '',
-        openIso: '',
-        closeIso: '',
+        openIso: ipo.openIso || '',
+        closeIso: ipo.closeIso || '',
+        listingIso: ipo.listingIso || '',
         pe: 0,
+        upcomingTier: ipo.status === 'upcoming' ? 'confirmed' : '',
+        shareholderParent: shParent,
       });
     }
   }
@@ -592,8 +700,11 @@ async function getHdIpoCardsMeta(forceRefresh = false): Promise<CardMetaItem[]> 
     const subClean = String(row['Sub'] || '').replace(/<[^>]+>/g, '').replace(/[xX]/g, '').trim();
     const subVal = parseNumberOrNull(subClean);
     const peVal = parseNumberOrNull(row['~P/E']) ?? 0;
-    const openIso = String(row['~Srt_Open'] || '').trim();
-    const closeIso = String(row['~Srt_Close'] || '').trim();
+    const openIso = toIsoDateOnly(row['~Srt_Open']);
+    const closeIso = toIsoDateOnly(row['~Srt_Close']);
+    const listingIso = toIsoDateOnly(row['~Str_Listing']);
+    const igCat = String(row['~IPO_Category'] || '').toLowerCase();
+    const igBoard: 'mainboard' | 'sme' = igCat.includes('sme') ? 'sme' : 'mainboard';
 
     let existing = byKey.get(key);
     if (!existing) {
@@ -606,6 +717,14 @@ async function getHdIpoCardsMeta(forceRefresh = false): Promise<CardMetaItem[]> 
       }
     }
 
+    const listedAtMatch = String(row['GMP'] || '').match(/L@\s*(?:&#8377;|₹)?\s*(\d+(?:\.\d+)?)/i);
+    const listedAtVal = listedAtMatch ? Number(listedAtMatch[1]) : null;
+    const priceNumIg = parseNumberOrNull(row['Price (₹)']);
+    const listedAtPct =
+      listedAtVal !== null && priceNumIg !== null && priceNumIg > 0
+        ? Number((((listedAtVal - priceNumIg) / priceNumIg) * 100).toFixed(2))
+        : null;
+
     if (existing) {
       if (lotVal > 0) existing.lotSize = lotVal;
       if (sizeClean && !existing.issueSize) existing.issueSize = sizeClean;
@@ -615,16 +734,32 @@ async function getHdIpoCardsMeta(forceRefresh = false): Promise<CardMetaItem[]> 
         existing.subNum = subVal;
       }
       if (peVal > 0) existing.pe = peVal;
-      if (openIso) existing.openIso = openIso;
-      if (closeIso) existing.closeIso = closeIso;
+      if (openIso && !existing.openIso) existing.openIso = openIso;
+      if (closeIso && !existing.closeIso) existing.closeIso = closeIso;
+      if (listingIso && !existing.listingIso) existing.listingIso = listingIso;
+      if (listedAtVal !== null && existing.listingOpenPrice === null) {
+        existing.listingOpenPrice = listedAtVal;
+        existing.listingOpenGainPct = listedAtPct;
+      }
     } else {
+      const todayIso = new Date(Date.now() + 5.5 * 3600000).toISOString().slice(0, 10);
+      let igStatus: 'open' | 'upcoming' | 'closed' | 'listed' = 'closed';
+      if (listedAtVal !== null) igStatus = 'listed';
+      else if (openIso && closeIso && openIso <= todayIso && todayIso <= closeIso) igStatus = 'open';
+      else if (openIso && openIso > todayIso) igStatus = 'upcoming';
+      else if (!openIso && !closeIso) igStatus = 'upcoming';
+
       byKey.set(key, {
         normName: key,
         name: rawName,
         slug: String(row['~urlrewrite_folder_name'] || '').replace(/^\/gmp\/|\/$/g, ''),
+        board: igBoard,
+        status: igStatus,
         logoUrl: '',
         lotSize: lotVal,
         issueSize: sizeClean,
+        issuePriceNum: priceNumIg,
+        registrar: 'NSE / BSE',
         gmp: Number.isFinite(gmpVal) ? gmpVal : 0,
         gmpPercent: Number.isFinite(gmpPct) ? gmpPct : 0,
         subNum: subVal,
@@ -634,13 +769,106 @@ async function getHdIpoCardsMeta(forceRefresh = false): Promise<CardMetaItem[]> 
         subAsOn: '',
         ofsPct: null,
         freshIssuePct: null,
+        listingOpenPrice: listedAtVal,
+        listingOpenGainPct: listedAtPct,
+        listingClosePrice: null,
+        listingCloseGainPct: null,
+        cmpPrice: null,
+        cmpGainPct: null,
         priceBand: row['Price (₹)'] ? `₹${String(row['Price (₹)']).trim()}` : '',
         openIso,
         closeIso,
+        listingIso,
         pe: peVal,
+        upcomingTier: igStatus === 'upcoming' && openIso ? 'confirmed' : '',
+        shareholderParent: detectShareholderParent(rawName),
       });
     }
   }
+
+  // Merge Curated High-Chance Upcoming IPOs (Shareholder Quota + Latest SEBI Approved Mainboard & SME)
+  const mergeCuratedUpcoming = (rows: Record<string, unknown>[], board: 'mainboard' | 'sme', maxApproved: number) => {
+    const parsed = rows
+      .map((r) => {
+        const name = stripHtml(r['Company']).trim();
+        const statusStr = stripHtml(r['Status']).trim();
+        const apprStr = stripHtml(r['Approval Date']).trim();
+        const drhpStr = stripHtml(r['DRHP Filing Date']).trim();
+        const isApproved = /approval received/i.test(statusStr);
+        const apprMs = parseChittorgarhShortDateMs(apprStr);
+        const drhpMs = parseChittorgarhShortDateMs(drhpStr);
+        const shParent = detectShareholderParent(name);
+        const issueSize = cleanUpcomingIssueSize(String(r['Estimated Issue Size'] || ''));
+        const rawImg = String(r['~compare_image'] || '').trim();
+        const logoUrl = /^https?:\/\//i.test(rawImg) ? rawImg : '';
+        const slug = String(r['~URLRewrite_Folder_Name'] || '').trim().toLowerCase();
+        return { name, isApproved, apprStr, drhpStr, apprMs, drhpMs, shParent, issueSize, logoUrl, slug };
+      })
+      .filter((x) => x.name.length > 2);
+
+    const shareholderRows = parsed.filter((x) => Boolean(x.shParent));
+    const approvedRows = parsed
+      .filter((x) => x.isApproved)
+      .sort((a, b) => (b.apprMs || b.drhpMs) - (a.apprMs || a.drhpMs))
+      .slice(0, maxApproved);
+
+    const selected = [...shareholderRows, ...approvedRows];
+    for (const item of selected) {
+      const key = normIpoKey(item.name);
+      if (!key) continue;
+      const existing = byKey.get(key);
+      const tier: 'shareholder' | 'sebi_approved' = item.shParent ? 'shareholder' : 'sebi_approved';
+      if (existing) {
+        if (item.shParent && !existing.shareholderParent) existing.shareholderParent = item.shParent;
+        if (item.apprStr && !existing.sebiApprovalDate) existing.sebiApprovalDate = item.apprStr;
+        if (item.drhpStr && !existing.drhpDate) existing.drhpDate = item.drhpStr;
+        if (item.issueSize && !existing.issueSize) existing.issueSize = item.issueSize;
+        if (item.logoUrl && !existing.logoUrl) existing.logoUrl = item.logoUrl;
+        if (item.slug && (!existing.slug || existing.slug === key)) existing.slug = item.slug;
+        if (existing.status === 'upcoming' && !existing.upcomingTier) existing.upcomingTier = tier;
+      } else {
+        byKey.set(key, {
+          normName: key,
+          name: item.name,
+          slug: item.slug || key,
+          board,
+          status: 'upcoming',
+          logoUrl: item.logoUrl,
+          lotSize: 0,
+          issueSize: item.issueSize,
+          issuePriceNum: null,
+          registrar: 'NSE / BSE',
+          gmp: 0,
+          gmpPercent: 0,
+          subNum: null,
+          subQib: '',
+          subNii: '',
+          subRetail: '',
+          subAsOn: '',
+          ofsPct: null,
+          freshIssuePct: null,
+          listingOpenPrice: null,
+          listingOpenGainPct: null,
+          listingClosePrice: null,
+          listingCloseGainPct: null,
+          cmpPrice: null,
+          cmpGainPct: null,
+          priceBand: '',
+          openIso: '',
+          closeIso: '',
+          listingIso: '',
+          pe: 0,
+          upcomingTier: tier,
+          sebiApprovalDate: item.apprStr || '',
+          drhpDate: item.drhpStr || '',
+          shareholderParent: item.shParent || '',
+        });
+      }
+    }
+  };
+
+  mergeCuratedUpcoming(mainUpcomingRows, 'mainboard', 18);
+  mergeCuratedUpcoming(smeUpcomingRows, 'sme', 6);
 
   const items = Array.from(byKey.values());
   cachedCardsMeta = { fetchedAt: nowMs, items };
