@@ -99,11 +99,48 @@ function getScoreTone(val) {
   return "weak";
 }
 
-// AUTO-ANALYST ENGINE (Har IPO ka Real RHP Data + Market Demand Dekh Kar Verdict & Target/SL Banata Hai)
+function computeLiveDemandScore(ipo) {
+  const qib = parseFloat(ipo.qibSub) || 0;
+  const tot = ipo.totalSubNum != null && Number.isFinite(Number(ipo.totalSubNum)) ? Number(ipo.totalSubNum) : null;
+  const gmpPct = parseFloat(ipo.gmpPercent) || 0;
+  const listGain = ipo.actualListingGain;
+  const status = String(ipo.status || "").toLowerCase();
+
+  let d = 5.4;
+  if (status === "upcoming" && (tot === null || tot === 0)) {
+    d = 5.5;
+  } else if (tot !== null) {
+    if (tot >= 30) d = 9.0;
+    else if (tot >= 10) d = 8.0;
+    else if (tot >= 3) d = 6.9;
+    else if (tot >= 1) d = 6.0;
+    else if (tot > 0) d = status === "open" ? 4.8 : 3.8;
+    else d = status === "open" ? 4.8 : 4.2;
+  }
+
+  if (qib >= 15) d += 0.8;
+  else if (qib >= 3) d += 0.4;
+  else if (qib > 0 && qib < 1 && status !== "open" && status !== "upcoming") d -= 0.5;
+
+  if (gmpPct >= 25) d += 0.9;
+  else if (gmpPct >= 12) d += 0.5;
+  else if (gmpPct >= 5) d += 0.25;
+  else if (gmpPct < 0) d -= 1.0;
+
+  if (listGain != null && Number.isFinite(Number(listGain))) {
+    if (listGain >= 20) d += 0.7;
+    else if (listGain < -5) d -= 0.8;
+  }
+
+  return Math.min(9.6, Math.max(2.5, +d.toFixed(1)));
+}
+
+// AUTO-ANALYST ENGINE (Har IPO ka Real RHP Data + Market Demand Dekh Kar Consistent Score & Verdict Banata Hai)
 function runAutoAnalyst(ipo) {
   const pe = parseFloat(ipo.pe) || 0;
   const indPe = parseFloat(ipo.industryPe) || 26;
   const roe = parseFloat(ipo.roeVal) || 0;
+  const ofsKnown = Boolean(ipo.ofsPctKnown || (ipo.freshIssue && ipo.freshIssue !== "Check RHP"));
   const ofs = parseFloat(ipo.ofsPercent) || 0;
   const qib = parseFloat(ipo.qibSub) || 0;
   const gmpPct = parseFloat(ipo.gmpPercent) || 0;
@@ -112,29 +149,44 @@ function runAutoAnalyst(ipo) {
   const de = ipo.debtToEquityNum != null ? Number(ipo.debtToEquityNum) : null;
   const da = ipo.deepAnalysis || null;
 
-  let score = 5.5;
+  const liveDemand = computeLiveDemandScore(ipo);
+  const hasRealBidding = qib > 0 || (ipo.totalSubNum != null && ipo.totalSubNum > 0);
+
+  let bizScore;
   if (da && typeof da.businessScore === "number") {
-    const hasDemand = qib > 0 || (ipo.totalSubNum != null && ipo.totalSubNum > 0) || da.demandScore !== 5.0;
-    if (hasDemand && ipo.status !== "upcoming") {
-      score = da.businessScore * 0.55 + da.demandScore * 0.45;
-    } else {
-      score = da.businessScore * 0.78 + 1.1;
+    bizScore = da.businessScore;
+    // Keep deepAnalysis demandScore synchronized with the freshest live Sub/GMP
+    if (hasRealBidding || gmpPct !== 0) {
+      da.demandScore = liveDemand;
+      da.demandLabel = liveDemand >= 7.5 ? "High Market Demand" : (liveDemand >= 5.5 ? "Moderate Demand" : "Low Demand");
     }
-    if (gmpPct >= 20) score += 0.4;
-    if (listGain != null && listGain > 15) score += 0.4;
-    if (ipo.category === "sme") score -= 0.3;
   } else {
-    if (pe > 0) { if (pe < indPe) score += 1.4; else if (pe > indPe * 1.3) score -= 1.2; }
-    if (roe >= 18) score += 0.9; else if (roe > 0 && roe < 10) score -= 0.7;
-    if (ofs <= 30) score += 0.7; else if (ofs >= 70) score -= 1.0;
-    if (qib >= 15) score += 1.3; else if (qib >= 5) score += 0.6;
-    if (gmpPct >= 20) score += 0.7;
-    if (listGain != null && listGain > 15) score += 0.6;
+    let est = 5.4;
+    if (pe > 0) {
+      if (pe <= 22) est += 0.8;
+      else if (pe < indPe) est += 0.4;
+      else if (pe > indPe * 1.4) est -= 0.9;
+    }
+    if (roe >= 18) est += 0.9;
+    else if (roe > 0 && roe < 10) est -= 0.6;
+    if (ofsKnown) {
+      if (ofs <= 30) est += 0.6;
+      else if (ofs >= 70) est -= 0.8;
+    }
+    bizScore = Math.min(9.0, Math.max(3.0, +est.toFixed(1)));
   }
+
+  let score;
+  if (ipo.status === "upcoming" && !hasRealBidding) {
+    score = bizScore * 0.72 + liveDemand * 0.28;
+  } else {
+    score = bizScore * 0.55 + liveDemand * 0.45;
+  }
+  if (ipo.category === "sme") score -= 0.3;
   score = Math.min(9.5, Math.max(2.5, +score.toFixed(1)));
 
   const verdict = score >= 7.0 ? (ipo.category === "sme" ? "APPLY (High Risk)" : "APPLY")
-                : score >= 5.3 ? "RISKY / MAY APPLY" : "AVOID";
+                : score >= 5.2 ? "RISKY / MAY APPLY" : "AVOID";
 
   const plus = [];
   const minus = [];
@@ -232,8 +284,63 @@ function extractCategorySub(cats, keyword) {
   return 0;
 }
 
+function normalizeIpoMatchKey(str) {
+  return String(str || "")
+    .toLowerCase()
+    .replace(/\b(limited|ltd|private|pvt|india|indian|ipo|sme|industries|enterprises|technologies|services|solutions|corp|corporation|co)\b/g, " ")
+    .replace(/[^a-z0-9]+/g, " ")
+    .trim();
+}
+
+function formatIsoShortMonthDay(isoStr) {
+  if (!isoStr) return "";
+  const m = String(isoStr).trim().match(/^(\d{4})-(\d{2})-(\d{2})/);
+  if (!m) return String(isoStr).trim();
+  const months = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+  const mon = months[parseInt(m[2], 10) - 1] || m[2];
+  const day = parseInt(m[3], 10);
+  return { mon, day, year: m[1] };
+}
+
+function formatOfferDateDisplay(openIso, closeIso, fallbackDates) {
+  const o = formatIsoShortMonthDay(openIso);
+  const c = formatIsoShortMonthDay(closeIso);
+  if (o && typeof o === "object" && c && typeof c === "object") {
+    return `${o.mon} ${o.day} - ${c.mon} ${c.day}, ${c.year}`;
+  }
+  if (o && typeof o === "object") {
+    return `${o.mon} ${o.day}, ${o.year}`;
+  }
+  return fallbackDates || "TBA";
+}
+
+function formatOfferPriceClean(priceBand, issuePrice) {
+  if (!priceBand) return issuePrice ? String(issuePrice) : "TBA";
+  const cleaned = String(priceBand)
+    .replace(/₹|Rs\.?/gi, "")
+    .replace(/\.00\b/g, "")
+    .replace(/\s*(?:to|-|–)\s*/gi, "-")
+    .trim();
+  return cleaned || (issuePrice ? String(issuePrice) : "TBA");
+}
+
+function formatIssueSizeClean(issueSize) {
+  if (!issueSize || issueSize === "NSE/BSE" || issueSize === "TBA") return "TBA";
+  return String(issueSize).replace(/^₹\s*/, "").trim();
+}
+
+function getCompanyShortTag(name) {
+  const words = String(name || "HD")
+    .replace(/\b(limited|ltd|private|pvt|india|indian|ipo)\b/gi, "")
+    .trim()
+    .split(/\s+/)
+    .filter(Boolean);
+  if (words.length >= 2) return (words[0][0] + words[1][0] + (words[2] ? words[2][0] : "")).toUpperCase().slice(0, 3);
+  return String(words[0] || "HD").slice(0, 3).toUpperCase();
+}
+
 // NORMALIZE ANY IPOS.MARKETS RECORD
-function mapOfficialRecord(item, subObj) {
+function mapOfficialRecord(item, subObj, metaObj) {
   // Prioritize `stage` because `status: "active"` means post-listing exchange trading
   const rawStage = String(item.stage || item.status || "").toLowerCase();
   const status = (rawStage === "open" || rawStage === "live") ? "live"
@@ -242,7 +349,7 @@ function mapOfficialRecord(item, subObj) {
 
   const board = String(item.board || item.segment || "").toLowerCase();
   const category = board.includes("sme") ? "sme" : "mainboard";
-  const rawBand = item.band || "";
+  const rawBand = item.band || metaObj?.priceBand || "";
   const issuePrice = Number(
     item.price || item.issue_price || item.price_high || item.upper_price || item.price_band_high || parseUpperBandPrice(rawBand) || 0
   ) || 100;
@@ -250,18 +357,39 @@ function mapOfficialRecord(item, subObj) {
   const priceBand = rawBand
     ? (String(rawBand).startsWith("₹") || String(rawBand).toLowerCase().startsWith("rs") ? String(rawBand) : `₹${rawBand}`)
     : (lowPrice && lowPrice !== issuePrice ? `₹${lowPrice} - ₹${issuePrice}` : `₹${issuePrice}`);
-  const lotSize = Number(item.lot_size || item.market_lot || 1);
+  const lotSize = Number(item.lot_size || item.market_lot || metaObj?.lotSize || 0);
   const minInvest = lotSize > 1 ? `₹${Math.round(issuePrice * lotSize).toLocaleString("en-IN")}` : "Check Lot";
 
-  const openD = item.open || item.open_date || item.opens || item.bidding_start || "";
-  const closeD = item.close || item.close_date || item.closes || item.bidding_end || "";
+  const openD = item.open || item.open_date || item.opens || item.bidding_start || metaObj?.openIso || "";
+  const closeD = item.close || item.close_date || item.closes || item.bidding_end || metaObj?.closeIso || "";
   const listingD = item.listing || item.listing_date || item.listed_on || "TBA";
   const dates = openD && closeD ? `${openD} to ${closeD}` : (openD || (listingD !== "TBA" ? `List: ${listingD}` : "Check Schedule"));
+  const offerDateDisplay = formatOfferDateDisplay(openD, closeD, dates);
 
-  const totSub = subObj?.total_times ?? subObj?.lower_bound_times ?? item.sub ?? item.subscription_total ?? item.total_times;
-  const qibSub = Number(subObj?.categories?.QIB?.times ?? extractCategorySub(subObj?.categories, "qib") ?? item.qib_times ?? 0);
-  const niiSub = Number(subObj?.categories?.NII?.times ?? extractCategorySub(subObj?.categories, "non institutional") ?? item.nii_times ?? 0);
-  const riiSub = Number(subObj?.categories?.RII?.times ?? extractCategorySub(subObj?.categories, "retail") ?? item.rii_times ?? 0);
+  const parseSubNumSafe = (val) => {
+    if (val == null || val === "") return null;
+    const n = Number(String(val).replace(/[^0-9.\-]/g, ""));
+    return Number.isFinite(n) ? n : null;
+  };
+  const rawTotSub = parseSubNumSafe(subObj?.total_times ?? subObj?.lower_bound_times ?? item.sub ?? item.subscription_total ?? item.total_times);
+  const metaTotSub = parseSubNumSafe(metaObj?.subNum);
+  let totSub = null;
+  if (rawTotSub != null && metaTotSub != null) totSub = Math.max(rawTotSub, metaTotSub);
+  else if (metaTotSub != null) totSub = metaTotSub;
+  else if (rawTotSub != null) totSub = rawTotSub;
+
+  const qibSub = Math.max(
+    Number(subObj?.categories?.QIB?.times ?? extractCategorySub(subObj?.categories, "qib") ?? item.qib_times ?? 0) || 0,
+    parseSubNumSafe(metaObj?.subQib) || 0
+  );
+  const niiSub = Math.max(
+    Number(subObj?.categories?.NII?.times ?? extractCategorySub(subObj?.categories, "non institutional") ?? item.nii_times ?? 0) || 0,
+    parseSubNumSafe(metaObj?.subNii) || 0
+  );
+  const riiSub = Math.max(
+    Number(subObj?.categories?.RII?.times ?? extractCategorySub(subObj?.categories, "retail") ?? item.rii_times ?? 0) || 0,
+    parseSubNumSafe(metaObj?.subRetail) || 0
+  );
 
   const listPrice = Number(item.listing_close || item.listing_open || item.listing_price || 0);
   const currPrice = Number(item.cmp || item.current_price || item.ltp || listPrice || 0);
@@ -269,42 +397,56 @@ function mapOfficialRecord(item, subObj) {
     item.gain != null && Number.isFinite(Number(item.gain))
       ? Number(item.gain)
       : (listPrice > 0 && issuePrice > 0 ? ((listPrice - issuePrice) / issuePrice) * 100 : null);
-  const gmp = Number(item.gmp || 0);
-  const gmpPercent = gmp > 0 && issuePrice > 0
-    ? +((gmp / issuePrice) * 100).toFixed(1)
-    : (actualListingGain != null ? +actualListingGain.toFixed(1) : 0);
+  const gmp = Number(item.gmp || metaObj?.gmp || 0);
+  const gmpPercent = metaObj?.gmpPercent
+    ? +Number(metaObj.gmpPercent).toFixed(1)
+    : (gmp !== 0 && issuePrice > 0
+      ? +((gmp / issuePrice) * 100).toFixed(1)
+      : (actualListingGain != null ? +actualListingGain.toFixed(1) : 0));
 
   const sizeNum = item.size ?? item.issue_size_cr;
-  const issueSize = sizeNum ? `₹${Number(sizeNum).toLocaleString("en-IN")} Cr` : (item.issue_size || "NSE/BSE");
+  const issueSize = sizeNum
+    ? `₹${Number(sizeNum).toLocaleString("en-IN")} Cr`
+    : (metaObj?.issueSize || item.issue_size || "TBA");
+
+  const rawOfs = item.ofs_pct ?? item.ofs_percent ?? metaObj?.ofsPct;
+  const ofsPctKnown = rawOfs != null && Number.isFinite(Number(rawOfs));
+  const ofsPctVal = ofsPctKnown ? Math.round(Number(rawOfs)) : 0;
+  const freshIssuePctVal = metaObj?.freshIssuePct != null ? Math.round(Number(metaObj.freshIssuePct)) : (ofsPctKnown ? Math.max(0, 100 - ofsPctVal) : null);
 
   const mapped = {
     id: item.slug || item.symbol || item.name,
     slug: item.slug || "",
     symbol: item.symbol || item.exchange?.nse || "",
     name: item.name || item.company_name || "IPO Issue",
-    category, status, dates,
+    logoUrl: metaObj?.logoUrl || "",
+    category, status, dates, offerDateDisplay,
+    openIso: openD,
+    closeIso: closeD,
     listingDate: listingD,
     openSort: openD || (listingD !== "TBA" ? listingD : (item.year ? `${item.year}-01-01` : "1999-01-01")),
-    priceBand, issuePrice, lotSize, minInvest,
+    priceBand, issuePrice, lotSize: lotSize || 1, minInvest,
     issueSize,
-    ofsPercent: Number(item.ofs_pct ?? item.ofs_percent ?? 0),
-    freshIssue: item.ofs_pct != null ? `${100 - Number(item.ofs_pct)}% Fresh / ${item.ofs_pct}% OFS` : "Check RHP",
+    ofsPercent: ofsPctVal,
+    ofsPctKnown,
+    freshIssue: ofsPctKnown ? `${freshIssuePctVal}% Fresh / ${ofsPctVal}% OFS` : "Check RHP",
     gmp, gmpPercent, listPrice, currPrice, actualListingGain,
     subscription: {
       total: totSub != null ? Number(totSub).toFixed(2) + "x" : (status === "upcoming" ? "0.0x" : "View"),
-      qib: qibSub ? qibSub.toFixed(2) + "x" : "-",
-      nii: niiSub ? niiSub.toFixed(2) + "x" : "-",
-      retail: riiSub ? riiSub.toFixed(2) + "x" : "-"
+      qib: qibSub ? qibSub.toFixed(2) + "x" : (metaObj?.subQib || "-"),
+      nii: niiSub ? niiSub.toFixed(2) + "x" : (metaObj?.subNii || "-"),
+      retail: riiSub ? riiSub.toFixed(2) + "x" : (metaObj?.subRetail || "-"),
+      asOn: metaObj?.subAsOn || ""
     },
     qibSub,
     totalSubNum: totSub != null ? Number(totSub) : null,
     registrar: item.registrar || item.rta || "NSE / BSE",
-    pe: Number(item.pe || item.pe_ratio || 0),
+    pe: Number(item.pe || item.pe_ratio || metaObj?.pe || 0),
     industryPe: Number(item.industry_pe || 26),
     roeVal: Number(item.roe || item.ronw || 0),
     financials: item.financials || [{ year: "Latest", revenue: "Tap to Load RHP", profit: "-", netWorth: "-" }],
     fundamentals: {
-      peRatio: item.pe ? `${item.pe}x` : "Tap to Load RHP",
+      peRatio: (item.pe || metaObj?.pe) ? `${item.pe || metaObj.pe}x` : "Tap to Load RHP",
       roe: item.roe ? `${item.roe}%` : "Tap to Load RHP",
       debtToEquity: item.debt_to_equity || "Check RHP"
     },
@@ -320,13 +462,19 @@ function mapOfficialRecord(item, subObj) {
 }
 
 // 100% AUTOMATIC LIVE + PAST + FUTURE SYNC
-async function syncLiveData(manualClick = false) {
+let lastLiveSyncMs = 0;
+let isSyncingLive = false;
+
+async function syncLiveData(manualClick = false, silentAuto = false) {
+  if (isSyncingLive && !manualClick) return;
+  isSyncingLive = true;
   const btn = document.getElementById("syncBtn");
-  if (btn) btn.innerHTML = `<span class="dot"></span> SYNCING...`;
+  if (btn && !silentAuto) btn.innerHTML = `<span class="dot"></span> SYNCING...`;
   try {
-    const [idxRes, subRes] = await Promise.all([
+    const [idxRes, subRes, metaRes] = await Promise.all([
       fetch("https://ipos.markets/data/issues_index.json?v=" + Date.now()),
-      fetch("https://ipos.markets/api/v1/subscription?v=" + Date.now()).catch(() => null)
+      fetch("https://ipos.markets/api/v1/subscription?v=" + Date.now()).catch(() => null),
+      fetch(`/api/hdipo/cards-meta${manualClick ? "?force=1&v=" : "?v="}${Date.now()}`).catch(() => null)
     ]);
 
     if (!idxRes.ok) throw new Error("Feed error");
@@ -343,22 +491,87 @@ async function syncLiveData(manualClick = false) {
       });
     }
 
+    const metaMap = new Map();
+    if (metaRes && metaRes.ok) {
+      const rawMeta = await metaRes.json();
+      const mList = Array.isArray(rawMeta.items) ? rawMeta.items : [];
+      mList.forEach(m => {
+        if (m.normName) metaMap.set(m.normName, m);
+      });
+    }
+
+    const findCardMeta = (item) => {
+      const k = normalizeIpoMatchKey(item.name || item.company_name || "");
+      if (!k) return null;
+      if (metaMap.has(k)) return metaMap.get(k);
+      for (const [mk, mv] of metaMap.entries()) {
+        if (mk.startsWith(k) || k.startsWith(mk)) return mv;
+      }
+      return null;
+    };
+
+    const prevById = new Map();
+    remoteIPOs.forEach(prev => {
+      if (prev && prev.id != null) prevById.set(String(prev.id), prev);
+    });
+
     const equityOnly = list
       .filter(i => !String(i.board || i.instrument || i.offer_type || "").toLowerCase().includes("debt"))
-      .map(i => mapOfficialRecord(i, subMap[i.slug] || subMap[i.symbol]))
+      .map(i => {
+        const mapped = mapOfficialRecord(i, subMap[i.slug] || subMap[i.symbol], findCardMeta(i));
+        const prev = prevById.get(String(mapped.id));
+        if (prev && prev.financialsLoaded) {
+          mapped.financialsLoaded = true;
+          mapped.financialsUnavailable = false;
+          mapped.rhpSourceUrl = prev.rhpSourceUrl || "";
+          mapped.financials = prev.financials;
+          mapped.kpis = prev.kpis;
+          mapped.fundamentals = prev.fundamentals;
+          mapped.business = prev.business;
+          mapped.deepAnalysis = prev.deepAnalysis ? { ...prev.deepAnalysis } : null;
+          if (prev.pe) mapped.pe = prev.pe;
+          if (prev.roeVal) mapped.roeVal = prev.roeVal;
+          if (prev.debtToEquityNum != null) mapped.debtToEquityNum = prev.debtToEquityNum;
+          if (prev.ofsPctKnown) {
+            mapped.ofsPercent = prev.ofsPercent;
+            mapped.ofsPctKnown = true;
+            mapped.freshIssue = prev.freshIssue;
+          }
+          if (prev.registrar && mapped.registrar === "NSE / BSE") mapped.registrar = prev.registrar;
+          runAutoAnalyst(mapped);
+        }
+        return mapped;
+      })
       .sort((a, b) => String(b.openSort).localeCompare(String(a.openSort)));
 
     if (equityOnly.length > 0) {
       remoteIPOs = equityOnly;
+      lastLiveSyncMs = Date.now();
       try { localStorage.setItem("hdRemoteIPOs", JSON.stringify(equityOnly.slice(0, 120))); } catch (_) {}
       renderCurrentPage();
-      if (manualClick) showNotice(`Sync Complete! ${equityOnly.length} Past, Live & Upcoming IPOs loaded.`);
+      prewarmLiveIpoFinancials();
+      if (manualClick) showNotice(`Live Sync Complete! ${equityOnly.length} IPOs (GMP & Subscription updated).`);
     }
   } catch (e) {
     if (manualClick) showNotice("Internet check karein ya thodi der baad SYNC LIVE dabayein!");
+  } finally {
+    isSyncingLive = false;
+    if (btn) btn.innerHTML = `<span class="dot"></span> SYNC`;
   }
-  if (btn) btn.innerHTML = `<span class="dot"></span> SYNC`;
 }
+
+// Auto live-update subscription & GMP every 45 seconds while app is open
+setInterval(() => {
+  if (document.visibilityState === "visible") {
+    syncLiveData(false, true);
+  }
+}, 45000);
+
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "visible" && Date.now() - lastLiveSyncMs > 30000) {
+    syncLiveData(false, true);
+  }
+});
 
 function renderCurrentPage() {
   const isHome = currentPage === "home";
@@ -392,15 +605,16 @@ function renderIPOs() {
   const showBanner = !isStandaloneApp && !sessionStorage.getItem("hdInstallBannerDismissed");
   const cfg = (window.hdAuth && window.hdAuth.appConfig) ? window.hdAuth.appConfig : { apkUrl: "", appVersion: "v1.0" };
   const hasApk = Boolean(cfg.apkUrl && /^https:\/\//i.test(cfg.apkUrl));
+  const bannerShareSvg = `<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="18" cy="5" r="3"></circle><circle cx="6" cy="12" r="3"></circle><circle cx="18" cy="19" r="3"></circle><line x1="8.59" y1="13.51" x2="15.42" y2="17.49"></line><line x1="15.41" y1="6.51" x2="8.59" y2="10.49"></line></svg>`;
   const installBannerHtml = showBanner ? `
     <div class="install-banner">
       <div class="install-banner-left">
         <b>📲 HD IPO Live App ${hasApk ? `(${escapeHtml(cfg.appVersion || "v1.0")})` : ""}</b>
         <small>Live GMP, 3-Yr Financials & Family Allotment — 1-Tap Install</small>
       </div>
-      <div style="display:flex;align-items:center;gap:5px;">
+      <div style="display:flex;align-items:center;gap:6px;flex-shrink:0;">
         <button class="btn-analyze" style="background:#15803d;" onclick="openInstallPopup()">Install Now</button>
-        <button class="btn-analyze" style="background:#1d4ed8;" onclick="openShareModal()" title="Share">📤</button>
+        <button type="button" class="btn-share-inline" style="background:#ffffff;" onclick="openShareModal()" title="Share HD IPO Live" aria-label="Share HD IPO Live">${bannerShareSvg}</button>
         <button class="banner-close" onclick="sessionStorage.setItem('hdInstallBannerDismissed','1');renderIPOs();" aria-label="Close">✕</button>
       </div>
     </div>
@@ -414,23 +628,57 @@ function renderIPOs() {
 }
 
 function buildIPOCard(ipo) {
+  const safeId = String(ipo.id).replace(/'/g, "\\'");
+  const shortTag = getCompanyShortTag(ipo.name);
   const catBadge = ipo.category === "sme"
-    ? `<span class="badge badge-sme">SME IPO</span>`
-    : `<span class="badge badge-mainboard">Mainboard</span>`;
-  const gmpClass = ipo.gmpPercent >= 10 ? "gmp-green" : "gmp-red";
-  const rightMetricLabel = ipo.currPrice > 0 ? "Current Price" : (ipo.gmp > 0 ? "Est. GMP" : "Status");
-  const rightMetricVal = ipo.currPrice > 0
-    ? `₹${ipo.currPrice} (${ipo.actualListingGain != null ? (ipo.actualListingGain >= 0 ? '+' : '') + ipo.actualListingGain.toFixed(1) + '%' : 'Listed'})`
-    : (ipo.gmp > 0 ? `₹${ipo.gmp} (${ipo.gmpPercent}%)` : ipo.status.toUpperCase());
+    ? `<span class="badge badge-sme badge-under-logo">SME</span>`
+    : `<span class="badge badge-mainboard badge-under-logo">Mainboard</span>`;
+  const offerDateText = ipo.offerDateDisplay || formatOfferDateDisplay(ipo.openIso, ipo.closeIso, ipo.dates);
+
+  const gmpClass = ipo.gmpPercent >= 10 || (ipo.gmp && Number(ipo.gmp) > 0) ? "gmp-green" : (ipo.gmpPercent < 0 ? "gmp-red" : "");
+  const rightMetricLabel = ipo.currPrice > 0 ? "Current Price" : (ipo.gmp ? "Est. GMP" : "Status");
+  let rightMetricVal = ipo.status.toUpperCase();
+  if (ipo.currPrice > 0) {
+    rightMetricVal = `₹${ipo.currPrice} (${ipo.actualListingGain != null ? (ipo.actualListingGain >= 0 ? "+" : "") + ipo.actualListingGain.toFixed(1) + "%" : "Listed"})`;
+  } else if (ipo.gmp && Number(ipo.gmp) !== 0) {
+    const gNum = Number(ipo.gmp);
+    const pNum = ipo.gmpPercent ? Number(ipo.gmpPercent).toFixed(1).replace(/\.0$/, "") : "0";
+    rightMetricVal = `₹${gNum % 1 === 0 ? gNum : gNum.toFixed(1)} (${gNum > 0 ? "+" : ""}${pNum}%)`;
+  }
+
+  const offerPriceDisplay = `₹${formatOfferPriceClean(ipo.priceBand, ipo.issuePrice)}`;
+  const minInvestSub = ipo.lotSize && ipo.lotSize > 1 ? ` (${ipo.lotSize} sh)` : "";
+  const subNumVal = ipo.totalSubNum != null && Number.isFinite(Number(ipo.totalSubNum)) ? Number(ipo.totalSubNum) : null;
+  const subTotalDisplay = subNumVal != null
+    ? `${subNumVal.toFixed(2)}x`
+    : (ipo.subscription?.total || "-");
+  const isLiveOpen = ipo.status === "open";
+  const subHighlightClass = subNumVal != null && subNumVal >= 1
+    ? "sub-highlight sub-highlight-hot"
+    : (subNumVal != null && subNumVal > 0 ? "sub-highlight sub-highlight-active" : "sub-highlight sub-highlight-neutral");
+  const liveDotHtml = isLiveOpen ? `<span class="sub-live-dot" title="Live Updating"></span>` : "";
+  const sizeClean = formatIssueSizeClean(ipo.issueSize);
+
+  const logoThumbHtml = ipo.logoUrl
+    ? `<div class="card-logo-thumb"><img src="${escapeHtml(ipo.logoUrl)}" alt="" loading="lazy" onerror="this.style.display='none';this.nextElementSibling.style.display='flex';"><span style="display:none;">${escapeHtml(shortTag)}</span></div>`
+    : `<div class="card-logo-thumb"><span>${escapeHtml(shortTag)}</span></div>`;
+
+  const shareSvg = `<svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="18" cy="5" r="3"></circle><circle cx="6" cy="12" r="3"></circle><circle cx="18" cy="19" r="3"></circle><line x1="8.59" y1="13.51" x2="15.42" y2="17.49"></line><line x1="15.41" y1="6.51" x2="8.59" y2="10.49"></line></svg>`;
+  const calSvg = `<svg viewBox="0 0 24 24" width="11" height="11" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="4" width="18" height="18" rx="2" ry="2"></rect><line x1="16" y1="2" x2="16" y2="6"></line><line x1="8" y1="2" x2="8" y2="6"></line><line x1="3" y1="10" x2="21" y2="10"></line></svg>`;
 
   return `
-    <div class="ipo-card" onclick="openAnalysis('${String(ipo.id).replace(/'/g, "\\'")}')">
+    <div class="ipo-card" onclick="openAnalysis('${safeId}')">
       <div class="card-top">
-        <div>
-          <div class="ipo-name">${escapeHtml(ipo.name)}</div>
-          <div class="tag-row">
+        <div class="card-brand-left">
+          <div class="card-logo-col">
+            ${logoThumbHtml}
             ${catBadge}
-            <span class="badge" style="background:#f1f5f9;color:#475569;">${escapeHtml(ipo.dates)}</span>
+          </div>
+          <div class="card-title-col">
+            <div class="ipo-name">${escapeHtml(ipo.name)}</div>
+            <div class="card-meta-row">
+              <span class="card-date-pill">${calSvg}<span>${escapeHtml(offerDateText)}</span></span>
+            </div>
           </div>
         </div>
         <div class="verdict-box">
@@ -440,17 +688,103 @@ function buildIPOCard(ipo) {
       </div>
 
       <div class="card-grid">
-        <div><div class="metric-label">Price Band</div><div class="metric-val">${escapeHtml(ipo.priceBand)}</div></div>
-        <div><div class="metric-label">Min Invest</div><div class="metric-val">${escapeHtml(ipo.minInvest)}</div></div>
-        <div><div class="metric-label">${rightMetricLabel}</div><div class="metric-val ${gmpClass}">${escapeHtml(rightMetricVal)}</div></div>
+        <div>
+          <div class="metric-label">Offer Price</div>
+          <div class="metric-val metric-val-lg">${escapeHtml(offerPriceDisplay)}</div>
+        </div>
+        <div>
+          <div class="metric-label">Min Invest</div>
+          <div class="metric-val metric-val-lg">${escapeHtml(ipo.minInvest)}<span class="metric-lot-sub">${escapeHtml(minInvestSub)}</span></div>
+        </div>
+        <div>
+          <div class="metric-label">${rightMetricLabel}</div>
+          <div class="metric-val metric-val-lg ${gmpClass}">${escapeHtml(rightMetricVal)}</div>
+        </div>
       </div>
 
       <div class="card-targets">
-        <div class="target-info"><b>Sub:</b> ${escapeHtml(ipo.subscription.total)} • <b>QIB:</b> ${escapeHtml(ipo.subscription.qib)}</div>
-        <button class="btn-analyze">Full Analysis →</button>
+        <div class="target-info">
+          <div class="target-sub-row">
+            <span class="${subHighlightClass}">${liveDotHtml}Sub: <strong>${escapeHtml(subTotalDisplay)}</strong></span>
+          </div>
+          <div class="target-submeta">
+            <span><b>QIB:</b> ${escapeHtml(ipo.subscription.qib)}</span>
+            ${sizeClean !== "TBA" ? `<span class="sub-sep">•</span><span><b>Size:</b> ${escapeHtml(sizeClean)}</span>` : ""}
+          </div>
+        </div>
+        <div class="card-action-group">
+          <button type="button" class="btn-share-inline" onclick="event.stopPropagation();shareSingleIpo('${safeId}')" title="Share IPO" aria-label="Share IPO">${shareSvg}</button>
+          <button class="btn-analyze">Full Analysis →</button>
+        </div>
       </div>
     </div>
   `;
+}
+
+function shareSingleIpo(id) {
+  const ipo = getAllIPOs().find(item => String(item.id) === String(id));
+  if (!ipo) {
+    openShareModal();
+    return;
+  }
+  const url = getShareAppLink();
+  const displayName = String(ipo.name || "IPO").replace(/\s+(Limited|Ltd\.?)$/i, "").trim();
+  const offerDateText = ipo.offerDateDisplay || ipo.dates || "TBA";
+  const priceText = formatOfferPriceClean(ipo.priceBand, ipo.issuePrice);
+  const lotText = ipo.lotSize && ipo.lotSize > 1 ? `${ipo.lotSize} Shares` : "Check App";
+  const subText = ipo.totalSubNum != null ? `${Number(ipo.totalSubNum).toFixed(2)} times` : (ipo.subscription?.total || "TBA");
+  const gmpText = ipo.gmp ? `₹${ipo.gmp} (${ipo.gmpPercent}%)` : (ipo.actualListingGain != null ? `${ipo.actualListingGain.toFixed(1)}%` : "Check Live");
+  const sizeText = formatIssueSizeClean(ipo.issueSize);
+
+  const msg = [
+    `📊 *${displayName} IPO — Live Update*`,
+    `📅 Offer Date: ${offerDateText}`,
+    `💰 Offer Price: ₹${priceText} | Lot Size: ${lotText}`,
+    `🔥 Exp. Premium (GMP): *${gmpText}*`,
+    `📈 Subscription: ${subText} | Issue Size: ${sizeText}`,
+    ``,
+    `3–4 Saal ka Financial Data, Company Analysis & Family PAN Allotment ke liye *HD IPO Live* install karein:`,
+    `📲 ${url}`
+  ].join("\n");
+
+  if (!popupOverlay) {
+    if (navigator.share) {
+      navigator.share({ title: `${displayName} IPO - HD IPO Live`, text: msg, url }).catch(() => {
+        copyTextSafe(msg);
+        showNotice(`${displayName} IPO details copied!`);
+      });
+    } else {
+      copyTextSafe(msg);
+      showNotice(`${displayName} IPO details copied!`);
+    }
+    return;
+  }
+
+  const waUrl = "https://wa.me/?text=" + encodeURIComponent(msg);
+  popupOverlay.innerHTML = `
+    <div class="hd-popup-card">
+      <button class="hd-popup-x" onclick="closePopupOverlay()" aria-label="Close">✕</button>
+      <div class="hd-popup-brand">
+        <img src="/pwa-192x192.png" alt="HD IPO" class="hd-popup-icon">
+        <div>
+          <div class="hd-popup-badge">SHARE IPO UPDATE</div>
+          <h3 class="hd-popup-title">${escapeHtml(displayName)}</h3>
+        </div>
+      </div>
+
+      <div class="share-preview-box">${escapeHtml(msg).replace(/\n/g, "<br>")}</div>
+
+      <a href="${waUrl}" target="_blank" rel="noopener noreferrer" class="hd-popup-btn-primary" style="text-decoration:none;display:block;text-align:center;">
+        💬 WhatsApp par Bhejein
+      </a>
+
+      <div class="hd-popup-row" style="margin-top:8px;">
+        <button class="hd-popup-btn-blue" style="margin-top:0;flex:1;" onclick="navigator.share ? navigator.share({title:'${escapeHtml(displayName)} IPO',text:decodeURIComponent('${encodeURIComponent(msg)}'),url:'${escapeHtml(url)}'}).catch(()=>{}) : (copyTextSafe(decodeURIComponent('${encodeURIComponent(msg)}')),showNotice('Copied!'))">📲 Share</button>
+        <button class="hd-popup-btn-outline" style="flex:1;" onclick="copyTextSafe(decodeURIComponent('${encodeURIComponent(msg)}'));showNotice('IPO Update Copied!')">📋 Copy</button>
+      </div>
+    </div>
+  `;
+  popupOverlay.classList.remove("hidden");
 }
 
 function renderGMPPage() {
@@ -597,6 +931,121 @@ function hasAdvanceUnlocked() {
   return Boolean(window.hdAuth && window.hdAuth.hasAdvanceAccess());
 }
 
+function applyFinancialsReportToIpo(ipo, finData) {
+  if (!finData || !finData.found) return false;
+  ipo.financialsLoaded = true;
+  ipo.financialsUnavailable = false;
+  ipo.rhpSourceUrl = finData.sourceUrl || "";
+
+  if (Array.isArray(finData.financials) && finData.financials.length) {
+    ipo.financials = finData.financials.map(f => ({
+      year: f.period || "-",
+      revenue: f.revenue || "-",
+      profit: f.profit || "-",
+      ebitda: f.ebitda || "-",
+      netWorth: f.netWorth || "-",
+      assets: f.assets || "-",
+      borrowing: f.borrowing || "-",
+      profitNum: f.profitNum
+    }));
+  }
+
+  const k = finData.kpis || {};
+  ipo.kpis = k;
+  if (k.prePe != null && k.prePe > 0) ipo.pe = Number(k.prePe);
+  else if (k.postPe != null && k.postPe > 0) ipo.pe = Number(k.postPe);
+  if (k.roeNum != null) ipo.roeVal = Number(k.roeNum);
+  if (k.debtToEquityNum != null) ipo.debtToEquityNum = Number(k.debtToEquityNum);
+
+  const peLabel = (k.prePe && k.postPe)
+    ? `Pre ${k.prePe}x / Post ${k.postPe}x`
+    : (k.prePe ? `${k.prePe}x (Pre)` : (k.postPe ? `${k.postPe}x (Post)` : (ipo.pe ? `${ipo.pe}x` : "N/A")));
+
+  ipo.fundamentals = {
+    peRatio: peLabel,
+    roe: k.roe || (ipo.roeVal ? `${ipo.roeVal}%` : "N/A"),
+    roce: k.roce || "",
+    debtToEquity: k.debtToEquity || ipo.fundamentals?.debtToEquity || "N/A",
+    patMargin: k.patMargin || "",
+    ebitdaMargin: k.ebitdaMargin || "",
+    pb: k.pb || "",
+    marketCap: k.marketCap || ""
+  };
+
+  const det = finData.issueDetails || {};
+  if (det.lotSize && det.lotSize > 0) ipo.lotSize = det.lotSize;
+  if (det.minInvest) ipo.minInvest = det.minInvest;
+  if (det.ofsPct != null) {
+    ipo.ofsPercent = Number(det.ofsPct);
+    ipo.ofsPctKnown = true;
+  }
+  if (det.freshIssuePct != null && det.ofsPct != null) {
+    ipo.freshIssue = `${det.freshIssuePct}% Fresh / ${det.ofsPct}% OFS`;
+  } else if (det.freshIssue || det.ofs) {
+    ipo.freshIssue = [det.freshIssue ? `Fresh: ${det.freshIssue}` : "", det.ofs ? `OFS: ${det.ofs}` : ""].filter(Boolean).join(" | ");
+  }
+  if (det.registrar) ipo.registrar = det.registrar;
+  if (det.issueSize && (!ipo.issueSize || ipo.issueSize === "NSE/BSE")) ipo.issueSize = det.issueSize;
+  if (det.priceBand && (!ipo.priceBand || ipo.priceBand === "₹100")) ipo.priceBand = det.priceBand;
+  if (det.listingDate && (!ipo.listingDate || ipo.listingDate === "TBA")) ipo.listingDate = det.listingDate;
+
+  const fs = finData.subscription || {};
+  if (fs.totalNum != null && fs.totalNum > 0) {
+    const mergedTot = Math.max(Number(ipo.totalSubNum) || 0, Number(fs.totalNum));
+    ipo.totalSubNum = mergedTot;
+    ipo.subscription.total = `${mergedTot.toFixed(2)}x`;
+  } else if (fs.total && (ipo.subscription.total === "View" || ipo.subscription.total === "0.0x")) {
+    ipo.subscription.total = fs.total;
+  }
+  if (fs.qibNum != null && fs.qibNum > 0) {
+    const mergedQib = Math.max(Number(ipo.qibSub) || 0, Number(fs.qibNum));
+    ipo.qibSub = mergedQib;
+    ipo.subscription.qib = `${mergedQib.toFixed(2)}x`;
+  }
+  if (fs.nii && ipo.subscription.nii === "-") ipo.subscription.nii = fs.nii;
+  if (fs.retail && ipo.subscription.retail === "-") ipo.subscription.retail = fs.retail;
+  if (fs.applications) ipo.subscription.applications = fs.applications;
+  if (fs.asOn) ipo.subscription.asOn = fs.asOn;
+
+  if (finData.business) ipo.business = finData.business;
+  if (finData.analysis) ipo.deepAnalysis = { ...finData.analysis };
+  return true;
+}
+
+const prewarmInFlight = new Set();
+async function prewarmLiveIpoFinancials() {
+  const candidates = remoteIPOs
+    .filter(ipo => (ipo.status === "open" || ipo.status === "upcoming") && !ipo.financialsLoaded && !prewarmInFlight.has(String(ipo.id)))
+    .slice(0, 8);
+  if (!candidates.length) return;
+
+  let anyUpdated = false;
+  await Promise.all(candidates.map(async (ipo) => {
+    const key = String(ipo.id);
+    prewarmInFlight.add(key);
+    try {
+      const finUrl = `/api/hdipo/financials?name=${encodeURIComponent(ipo.name)}&slug=${encodeURIComponent(ipo.slug || "")}`;
+      const res = await fetch(finUrl).catch(() => null);
+      if (res && res.ok) {
+        const finData = await res.json();
+        if (applyFinancialsReportToIpo(ipo, finData)) {
+          runAutoAnalyst(ipo);
+          anyUpdated = true;
+        }
+      }
+    } catch (_) {
+      // ignore background prewarm failure
+    } finally {
+      prewarmInFlight.delete(key);
+    }
+  }));
+
+  if (anyUpdated) {
+    try { localStorage.setItem("hdRemoteIPOs", JSON.stringify(remoteIPOs.slice(0, 120))); } catch (_) {}
+    renderCurrentPage();
+  }
+}
+
 async function openAnalysis(id) {
   let ipo = getAllIPOs().find(item => String(item.id) === String(id));
   if (!ipo) return;
@@ -624,7 +1073,7 @@ async function openAnalysis(id) {
       const d = await detRes.json();
       if (d.pe || d.fundamentals?.pe) ipo.pe = Number(d.pe || d.fundamentals.pe);
       if (d.roe || d.fundamentals?.roe) ipo.roeVal = Number(d.roe || d.fundamentals.roe);
-      if (d.ofs_pct != null) { ipo.ofsPercent = Number(d.ofs_pct); ipo.freshIssue = `${100 - ipo.ofsPercent}% Fresh / ${ipo.ofsPercent}% OFS`; }
+      if (d.ofs_pct != null) { ipo.ofsPercent = Number(d.ofs_pct); ipo.ofsPctKnown = true; ipo.freshIssue = `${100 - ipo.ofsPercent}% Fresh / ${ipo.ofsPercent}% OFS`; }
       if (Array.isArray(d.financials) && d.financials.length) {
         ipo.financials = d.financials.map(f => ({
           year: f.year || f.fy || "-",
@@ -644,107 +1093,45 @@ async function openAnalysis(id) {
       }
       const latestSub = d.subscription?.latest;
       if (latestSub) {
-        if (latestSub.total_times != null) {
-          ipo.totalSubNum = Number(latestSub.total_times);
-          ipo.subscription.total = ipo.totalSubNum.toFixed(2) + "x";
+        if (latestSub.total_times != null && Number(latestSub.total_times) > 0) {
+          const mergedTot = Math.max(Number(ipo.totalSubNum) || 0, Number(latestSub.total_times));
+          ipo.totalSubNum = mergedTot;
+          ipo.subscription.total = mergedTot.toFixed(2) + "x";
         }
         const qibT = extractCategorySub(latestSub.categories, "qib");
         const niiT = extractCategorySub(latestSub.categories, "non institutional");
         const retT = extractCategorySub(latestSub.categories, "retail");
-        if (qibT > 0) { ipo.qibSub = qibT; ipo.subscription.qib = qibT.toFixed(2) + "x"; }
-        if (niiT > 0) ipo.subscription.nii = niiT.toFixed(2) + "x";
-        if (retT > 0) ipo.subscription.retail = retT.toFixed(2) + "x";
+        if (qibT > 0) {
+          const mergedQib = Math.max(Number(ipo.qibSub) || 0, qibT);
+          ipo.qibSub = mergedQib;
+          ipo.subscription.qib = mergedQib.toFixed(2) + "x";
+        }
+        if (niiT > 0 && ipo.subscription.nii === "-") ipo.subscription.nii = niiT.toFixed(2) + "x";
+        if (retT > 0 && ipo.subscription.retail === "-") ipo.subscription.retail = retT.toFixed(2) + "x";
       }
     }
 
     if (subRes && subRes.ok) {
       const s = await subRes.json();
       const tot = s.total_times ?? s.lower_bound_times;
-      if (tot != null) {
-        ipo.totalSubNum = Number(tot);
-        ipo.subscription.total = ipo.totalSubNum.toFixed(2) + "x";
+      if (tot != null && Number(tot) > 0) {
+        const mergedTot = Math.max(Number(ipo.totalSubNum) || 0, Number(tot));
+        ipo.totalSubNum = mergedTot;
+        ipo.subscription.total = mergedTot.toFixed(2) + "x";
       }
-      if (s.categories?.QIB?.times != null) { ipo.qibSub = Number(s.categories.QIB.times); ipo.subscription.qib = ipo.qibSub.toFixed(2) + "x"; }
-      if (s.categories?.NII?.times != null) ipo.subscription.nii = Number(s.categories.NII.times).toFixed(2) + "x";
-      if (s.categories?.RII?.times != null) ipo.subscription.retail = Number(s.categories.RII.times).toFixed(2) + "x";
+      if (s.categories?.QIB?.times != null && Number(s.categories.QIB.times) > 0) {
+        const mergedQib = Math.max(Number(ipo.qibSub) || 0, Number(s.categories.QIB.times));
+        ipo.qibSub = mergedQib;
+        ipo.subscription.qib = mergedQib.toFixed(2) + "x";
+      }
+      if (s.categories?.NII?.times != null && ipo.subscription.nii === "-") ipo.subscription.nii = Number(s.categories.NII.times).toFixed(2) + "x";
+      if (s.categories?.RII?.times != null && ipo.subscription.retail === "-") ipo.subscription.retail = Number(s.categories.RII.times).toFixed(2) + "x";
     }
 
     // Merge 3-4 Year RHP Financials, Ratios, Business Strengths & Deep Strength vs Demand Analysis
     if (finRes && finRes.ok) {
       const finData = await finRes.json();
-      if (finData && finData.found) {
-        ipo.financialsLoaded = true;
-        ipo.financialsUnavailable = false;
-        ipo.rhpSourceUrl = finData.sourceUrl || "";
-
-        if (Array.isArray(finData.financials) && finData.financials.length) {
-          ipo.financials = finData.financials.map(f => ({
-            year: f.period || "-",
-            revenue: f.revenue || "-",
-            profit: f.profit || "-",
-            ebitda: f.ebitda || "-",
-            netWorth: f.netWorth || "-",
-            assets: f.assets || "-",
-            borrowing: f.borrowing || "-",
-            profitNum: f.profitNum
-          }));
-        }
-
-        const k = finData.kpis || {};
-        ipo.kpis = k;
-        if (k.prePe != null && k.prePe > 0) ipo.pe = Number(k.prePe);
-        else if (k.postPe != null && k.postPe > 0) ipo.pe = Number(k.postPe);
-        if (k.roeNum != null) ipo.roeVal = Number(k.roeNum);
-        if (k.debtToEquityNum != null) ipo.debtToEquityNum = Number(k.debtToEquityNum);
-
-        const peLabel = (k.prePe && k.postPe)
-          ? `Pre ${k.prePe}x / Post ${k.postPe}x`
-          : (k.prePe ? `${k.prePe}x (Pre)` : (k.postPe ? `${k.postPe}x (Post)` : (ipo.pe ? `${ipo.pe}x` : "N/A")));
-
-        ipo.fundamentals = {
-          peRatio: peLabel,
-          roe: k.roe || (ipo.roeVal ? `${ipo.roeVal}%` : "N/A"),
-          roce: k.roce || "",
-          debtToEquity: k.debtToEquity || ipo.fundamentals?.debtToEquity || "N/A",
-          patMargin: k.patMargin || "",
-          ebitdaMargin: k.ebitdaMargin || "",
-          pb: k.pb || "",
-          marketCap: k.marketCap || ""
-        };
-
-        const det = finData.issueDetails || {};
-        if (det.lotSize && det.lotSize > 0) ipo.lotSize = det.lotSize;
-        if (det.minInvest) ipo.minInvest = det.minInvest;
-        if (det.ofsPct != null) ipo.ofsPercent = Number(det.ofsPct);
-        if (det.freshIssuePct != null && det.ofsPct != null) {
-          ipo.freshIssue = `${det.freshIssuePct}% Fresh / ${det.ofsPct}% OFS`;
-        } else if (det.freshIssue || det.ofs) {
-          ipo.freshIssue = [det.freshIssue ? `Fresh: ${det.freshIssue}` : "", det.ofs ? `OFS: ${det.ofs}` : ""].filter(Boolean).join(" | ");
-        }
-        if (det.registrar) ipo.registrar = det.registrar;
-        if (det.issueSize && (!ipo.issueSize || ipo.issueSize === "NSE/BSE")) ipo.issueSize = det.issueSize;
-        if (det.priceBand && (!ipo.priceBand || ipo.priceBand === "₹100")) ipo.priceBand = det.priceBand;
-        if (det.listingDate && (!ipo.listingDate || ipo.listingDate === "TBA")) ipo.listingDate = det.listingDate;
-
-        const fs = finData.subscription || {};
-        if (fs.totalNum != null && fs.totalNum > 0) {
-          ipo.totalSubNum = fs.totalNum;
-          ipo.subscription.total = fs.total || `${fs.totalNum.toFixed(2)}x`;
-        } else if (fs.total && (ipo.subscription.total === "View" || ipo.subscription.total === "0.0x")) {
-          ipo.subscription.total = fs.total;
-        }
-        if (fs.qibNum != null && fs.qibNum > 0) {
-          ipo.qibSub = fs.qibNum;
-          ipo.subscription.qib = fs.qib || `${fs.qibNum.toFixed(2)}x`;
-        }
-        if (fs.nii && ipo.subscription.nii === "-") ipo.subscription.nii = fs.nii;
-        if (fs.retail && ipo.subscription.retail === "-") ipo.subscription.retail = fs.retail;
-        if (fs.applications) ipo.subscription.applications = fs.applications;
-        if (fs.asOn) ipo.subscription.asOn = fs.asOn;
-
-        if (finData.business) ipo.business = finData.business;
-        if (finData.analysis) ipo.deepAnalysis = finData.analysis;
-      }
+      applyFinancialsReportToIpo(ipo, finData);
     }
 
     if (!ipo.financialsLoaded) {
@@ -759,12 +1146,18 @@ async function openAnalysis(id) {
     }
 
     ipo = runAutoAnalyst(ipo);
-    drawModal(ipo, false);
+    try { localStorage.setItem("hdRemoteIPOs", JSON.stringify(remoteIPOs.slice(0, 120))); } catch (_) {}
+    renderCurrentPage();
+    if (activeAnalysisIpoId === String(ipo.id)) {
+      drawModal(ipo, false);
+    }
   } catch (_) {
     if (!ipo.financialsLoaded && (!Array.isArray(ipo.financials) || ipo.financials[0]?.revenue === "Tap to Load RHP")) {
       ipo.financialsUnavailable = true;
     }
-    drawModal(ipo, false);
+    if (activeAnalysisIpoId === String(ipo.id)) {
+      drawModal(ipo, false);
+    }
   }
 }
 

@@ -11,7 +11,7 @@ const __dirname = path.dirname(__filename);
 
 const PORT = Number(process.env.PORT) || 3000;
 const FALLBACK_GEMINI_MODEL = 'gemini-3.1-flash-lite';
-const LIVE_CACHE_TTL_MS = 5 * 60 * 1000;
+const LIVE_CACHE_TTL_MS = 60 * 1000;
 
 interface GroundingSource {
   title: string;
@@ -22,6 +22,7 @@ interface MergedLiveIpo {
   slug: string;
   companyName: string;
   detailUrl: string;
+  logoUrl: string;
   board: 'mainboard' | 'sme';
   status: 'open' | 'upcoming' | 'closed' | 'listed';
   openDate: string;
@@ -335,10 +336,14 @@ async function getLiveChittorgarhFeed(forceRefresh = false): Promise<CachedFeed>
     const openTs = Date.parse(String(row['~Issue_Open_Date'] ?? ''));
     const sortTime = Number.isFinite(openTs) ? openTs : 0;
 
+    const logoRaw = String(row['~compare_image'] ?? '').trim();
+    const logoUrl = /^https?:\/\//i.test(logoRaw) ? logoRaw : '';
+
     return {
       slug,
       companyName,
       detailUrl,
+      logoUrl,
       board,
       status,
       openDate,
@@ -422,6 +427,224 @@ async function getLiveChittorgarhFeed(forceRefresh = false): Promise<CachedFeed>
 
   cachedFeed = feed;
   return feed;
+}
+
+interface CardMetaItem {
+  normName: string;
+  name: string;
+  slug: string;
+  logoUrl: string;
+  lotSize: number;
+  issueSize: string;
+  gmp: number;
+  gmpPercent: number;
+  subNum: number | null;
+  subQib: string;
+  subNii: string;
+  subRetail: string;
+  subAsOn: string;
+  ofsPct: number | null;
+  freshIssuePct: number | null;
+  priceBand: string;
+  openIso: string;
+  closeIso: string;
+  pe: number;
+}
+
+let cachedCardsMeta: { fetchedAt: number; items: CardMetaItem[] } | null = null;
+
+function normIpoKey(s: string): string {
+  return String(s || '')
+    .toLowerCase()
+    .replace(/\b(limited|ltd|private|pvt|india|indian|ipo|sme|industries|enterprises|technologies|services|solutions|corp|corporation|co)\b/g, ' ')
+    .replace(/[^a-z0-9]+/g, ' ')
+    .trim();
+}
+
+async function fetchInvestorGainGmpRows(): Promise<Record<string, unknown>[]> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 9000);
+  try {
+    const res = await fetch('https://www.investorgain.com/report/live-ipo-gmp/331/', {
+      signal: controller.signal,
+      headers: {
+        'User-Agent':
+          'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
+        Accept: 'text/html,application/xhtml+xml;q=0.9,*/*;q=0.8',
+      },
+    });
+    if (!res.ok) return [];
+    const html = await res.text();
+    const chunks: string[] = [];
+    const re = /self\.__next_f\.push\(\[1,("((?:\\.|[^"\\])*)")\]\)/g;
+    let m: RegExpExecArray | null;
+    while ((m = re.exec(html))) {
+      try {
+        chunks.push(JSON.parse(m[1]));
+      } catch {
+        // ignore malformed chunk
+      }
+    }
+    const full = chunks.join('');
+    const idx = full.indexOf('"reportTableData":[');
+    if (idx === -1) return [];
+    const arrStart = full.indexOf('[', idx);
+    let depth = 0;
+    let end = -1;
+    let inStr = false;
+    let esc = false;
+    for (let i = arrStart; i < full.length; i++) {
+      const ch = full[i];
+      if (esc) {
+        esc = false;
+        continue;
+      }
+      if (ch === '\\') {
+        esc = true;
+        continue;
+      }
+      if (ch === '"') {
+        inStr = !inStr;
+        continue;
+      }
+      if (!inStr) {
+        if (ch === '[') depth++;
+        else if (ch === ']') {
+          depth--;
+          if (depth === 0) {
+            end = i + 1;
+            break;
+          }
+        }
+      }
+    }
+    if (end === -1) return [];
+    const parsed = JSON.parse(full.slice(arrStart, end));
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function getHdIpoCardsMeta(forceRefresh = false): Promise<CardMetaItem[]> {
+  const nowMs = Date.now();
+  if (!forceRefresh && cachedCardsMeta && nowMs - cachedCardsMeta.fetchedAt < LIVE_CACHE_TTL_MS) {
+    return cachedCardsMeta.items;
+  }
+
+  const [feedResult, gmpRows] = await Promise.all([
+    getLiveChittorgarhFeed(forceRefresh).catch(() => null),
+    fetchInvestorGainGmpRows(),
+  ]);
+
+  const byKey = new Map<string, CardMetaItem>();
+
+  if (feedResult && Array.isArray(feedResult.allIpos)) {
+    for (const ipo of feedResult.allIpos) {
+      const key = normIpoKey(ipo.companyName);
+      if (!key) continue;
+      byKey.set(key, {
+        normName: key,
+        name: ipo.companyName,
+        slug: ipo.slug,
+        logoUrl: ipo.logoUrl || '',
+        lotSize: ipo.lotSize || 0,
+        issueSize: ipo.issueSize && ipo.issueSize !== 'TBA' ? ipo.issueSize : '',
+        gmp: 0,
+        gmpPercent: 0,
+        subNum: ipo.subscriptionNum,
+        subQib: ipo.subscriptionQib && ipo.subscriptionQib !== '—' ? ipo.subscriptionQib : '',
+        subNii: ipo.subscriptionNii && ipo.subscriptionNii !== '—' ? ipo.subscriptionNii : '',
+        subRetail: ipo.subscriptionRetail && ipo.subscriptionRetail !== '—' ? ipo.subscriptionRetail : '',
+        subAsOn: ipo.subscriptionAsOn || '',
+        ofsPct: ipo.ofsPct ?? null,
+        freshIssuePct: ipo.freshIssuePct ?? null,
+        priceBand: ipo.priceBand && ipo.priceBand !== 'TBA' ? ipo.priceBand : '',
+        openIso: '',
+        closeIso: '',
+        pe: 0,
+      });
+    }
+  }
+
+  for (const row of gmpRows) {
+    const rawName = String(row['~ipo_name'] || '').trim();
+    const key = normIpoKey(rawName);
+    if (!key) continue;
+
+    const gmpClean = String(row['GMP'] || '')
+      .replace(/&#8377;/g, '')
+      .replace(/<[^>]+>/g, ' ')
+      .replace(/\s+/g, ' ')
+      .trim();
+    const gmpMatch = gmpClean.match(/(-?\d+(?:\.\d+)?)\s*\(\s*(-?\d+(?:\.\d+)?)%\s*\)/);
+    const gmpVal = gmpMatch ? Number(gmpMatch[1]) : 0;
+    const gmpPctRaw = parseNumberOrNull(row['~gmp_percent_calc']);
+    const gmpPct = gmpPctRaw !== null ? gmpPctRaw : gmpMatch ? Number(gmpMatch[2]) : 0;
+
+    const lotVal = Number(String(row['Lot'] || '0').replace(/\D/g, '')) || 0;
+    const sizeClean = String(row['IPO Size'] || '')
+      .replace(/&#8377;/g, '')
+      .replace(/<[^>]+>/g, '')
+      .trim();
+    const subClean = String(row['Sub'] || '').replace(/<[^>]+>/g, '').replace(/[xX]/g, '').trim();
+    const subVal = parseNumberOrNull(subClean);
+    const peVal = parseNumberOrNull(row['~P/E']) ?? 0;
+    const openIso = String(row['~Srt_Open'] || '').trim();
+    const closeIso = String(row['~Srt_Close'] || '').trim();
+
+    let existing = byKey.get(key);
+    if (!existing) {
+      // Fuzzy prefix match against Chittorgarh entries so logoUrl merges even if suffixes differ
+      for (const [ck, cv] of byKey.entries()) {
+        if (ck.startsWith(key) || key.startsWith(ck)) {
+          existing = cv;
+          break;
+        }
+      }
+    }
+
+    if (existing) {
+      if (lotVal > 0) existing.lotSize = lotVal;
+      if (sizeClean && !existing.issueSize) existing.issueSize = sizeClean;
+      if (Number.isFinite(gmpVal)) existing.gmp = gmpVal;
+      if (Number.isFinite(gmpPct)) existing.gmpPercent = gmpPct;
+      if (subVal !== null && (existing.subNum === null || subVal > existing.subNum)) {
+        existing.subNum = subVal;
+      }
+      if (peVal > 0) existing.pe = peVal;
+      if (openIso) existing.openIso = openIso;
+      if (closeIso) existing.closeIso = closeIso;
+    } else {
+      byKey.set(key, {
+        normName: key,
+        name: rawName,
+        slug: String(row['~urlrewrite_folder_name'] || '').replace(/^\/gmp\/|\/$/g, ''),
+        logoUrl: '',
+        lotSize: lotVal,
+        issueSize: sizeClean,
+        gmp: Number.isFinite(gmpVal) ? gmpVal : 0,
+        gmpPercent: Number.isFinite(gmpPct) ? gmpPct : 0,
+        subNum: subVal,
+        subQib: '',
+        subNii: '',
+        subRetail: '',
+        subAsOn: '',
+        ofsPct: null,
+        freshIssuePct: null,
+        priceBand: row['Price (₹)'] ? `₹${String(row['Price (₹)']).trim()}` : '',
+        openIso,
+        closeIso,
+        pe: peVal,
+      });
+    }
+  }
+
+  const items = Array.from(byKey.values());
+  cachedCardsMeta = { fetchedAt: nowMs, items };
+  return items;
 }
 
 function getAiClient(): GoogleGenAI | null {
@@ -524,6 +747,18 @@ async function startServer() {
         found: false,
         error: 'Financial data load nahi ho saka. Thodi der baad dobara try karein.',
       });
+    }
+  });
+
+  // Live Card Enrichment (Company Logos + Live GMP + Lot Size + Issue Size)
+  app.get('/api/hdipo/cards-meta', async (req, res) => {
+    const force = req.query.force === '1' || req.query.force === 'true';
+    try {
+      const items = await getHdIpoCardsMeta(force);
+      res.json({ ok: true, count: items.length, items });
+    } catch (err) {
+      console.error('HD IPO cards-meta error:', err);
+      res.json({ ok: false, count: 0, items: [] });
     }
   });
 
