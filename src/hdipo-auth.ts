@@ -284,6 +284,7 @@ interface HdAuthBridge {
   isAdmin: () => boolean;
   isLoggedIn: () => boolean;
   isPhoneUser: () => boolean;
+  getIdToken: () => Promise<string | null>;
   needsMobileRegistration: () => boolean;
   hasAdvanceAccess: () => boolean;
   sendMobileOtp: (
@@ -380,6 +381,15 @@ const hdAuth: HdAuthBridge = {
 
   isLoggedIn() {
     return Boolean(this.user && (extractIndianMobile(this.user.phoneNumber) || this.user.emailVerified));
+  },
+
+  async getIdToken() {
+    if (!auth.currentUser) return null;
+    try {
+      return await auth.currentUser.getIdToken(true);
+    } catch {
+      return null;
+    }
   },
 
   needsMobileRegistration() {

@@ -5,6 +5,7 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import { GoogleGenAI } from '@google/genai';
 import { fetchIpoFinancialsReport } from './ipoFinancials.ts';
+import { buildHdIpoAndroidProjectZip } from './androidApkProject.ts';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -1076,6 +1077,129 @@ async function startServer() {
 
   app.get('/api/download/base.apk', handleBaseApkDownload);
   app.get('/base.apk', handleBaseApkDownload);
+
+  const OWNER_EMAIL = 'prajapatih000@gmail.com';
+  const readFirebaseApiKey = (): string => {
+    try {
+      const cfgPath = path.join(__dirname, 'firebase-applet-config.json');
+      if (!fs.existsSync(cfgPath)) return '';
+      const parsed = JSON.parse(fs.readFileSync(cfgPath, 'utf8')) as { apiKey?: string };
+      return String(parsed.apiKey || '').trim();
+    } catch {
+      return '';
+    }
+  };
+
+  const verifyOwnerFirebaseToken = async (idToken: string): Promise<boolean> => {
+    const apiKey = readFirebaseApiKey();
+    if (!apiKey || !idToken) return false;
+    try {
+      const resp = await fetch(
+        `https://identitytoolkit.googleapis.com/v1/accounts:lookup?key=${encodeURIComponent(apiKey)}`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ idToken }),
+        }
+      );
+      if (!resp.ok) return false;
+      const data = (await resp.json()) as {
+        users?: Array<{ email?: string; emailVerified?: boolean }>;
+      };
+      const user = data.users?.[0];
+      return Boolean(
+        user &&
+          user.emailVerified === true &&
+          String(user.email || '').toLowerCase() === OWNER_EMAIL
+      );
+    } catch {
+      return false;
+    }
+  };
+
+  // Owner-only direct base.apk upload: validates real signed APK zip + AndroidManifest.xml and hosts it immediately
+  app.post(
+    '/api/hdipo/upload-apk',
+    express.raw({ type: '*/*', limit: '45mb' }),
+    async (req, res) => {
+      const authHeader = String(req.headers.authorization || '');
+      const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7).trim() : '';
+      const isOwner = await verifyOwnerFirebaseToken(token);
+      if (!isOwner) {
+        res.status(403).json({
+          ok: false,
+          error: 'Sirf App Owner account se hi base.apk upload kar sakte hain.',
+        });
+        return;
+      }
+
+      const buf = Buffer.isBuffer(req.body) ? req.body : Buffer.alloc(0);
+      if (buf.length < 1024) {
+        res.status(400).json({ ok: false, error: 'APK file khali ya invalid hai.' });
+        return;
+      }
+
+      // Verify ZIP magic header (PK\x03\x04) and presence of AndroidManifest.xml inside APK
+      const isZip = buf[0] === 0x50 && buf[1] === 0x4b && buf[2] === 0x03 && buf[3] === 0x04;
+      const hasManifest = buf.includes(Buffer.from('AndroidManifest.xml', 'utf8'));
+      if (!isZip || !hasManifest) {
+        res.status(400).json({
+          ok: false,
+          error: 'Ye valid Android .apk file nahi lag rahi (AndroidManifest.xml missing). Asli signed base.apk upload karein.',
+        });
+        return;
+      }
+
+      try {
+        const publicApkPath = path.join(__dirname, 'public', 'base.apk');
+        fs.writeFileSync(publicApkPath, buf);
+        const distDir = path.join(__dirname, 'dist');
+        if (fs.existsSync(distDir)) {
+          fs.writeFileSync(path.join(distDir, 'base.apk'), buf);
+        }
+        res.json({ ok: true, sizeBytes: buf.length, fileName: 'base.apk' });
+      } catch (err) {
+        res.status(500).json({
+          ok: false,
+          error: err instanceof Error ? err.message : 'APK file save karne mein error aayi.',
+        });
+      }
+    }
+  );
+
+  // Ready-to-Build Android Native WebView + GitHub Actions Auto-APK Project ZIP
+  app.get('/api/download/android-project.zip', (req, res) => {
+    const rawVer = typeof req.query.v === 'string' ? req.query.v.trim() : 'v1.0';
+    const safeVer = rawVer.replace(/[^a-zA-Z0-9._-]/g, '').slice(0, 24) || 'v1.0';
+    const rawUrl = typeof req.query.appUrl === 'string' ? req.query.appUrl.trim() : '';
+
+    let appUrl = '';
+    if (rawUrl && /^https:\/\/[a-z0-9.-]+/i.test(rawUrl)) {
+      appUrl = rawUrl.replace(/^https:\/\/ais-dev-/i, 'https://ais-pre-');
+    } else {
+      const proto = String(req.headers['x-forwarded-proto'] || req.protocol || 'https').split(',')[0].trim();
+      const host = String(req.headers['x-forwarded-host'] || req.headers.host || '').split(',')[0].trim();
+      appUrl = host
+        ? `${proto}://${host}`.replace(/^https:\/\/ais-dev-/i, 'https://ais-pre-')
+        : 'https://ais-pre-kagvgilpqnpwpkaqi7qqki-273113077839.asia-northeast1.run.app';
+    }
+
+    try {
+      const zipBuf = buildHdIpoAndroidProjectZip({
+        appUrl,
+        versionName: safeVer,
+        publicDir: path.join(__dirname, 'public'),
+      });
+      const fileName = `HD-IPO-${safeVer}-Android-APK-Project.zip`;
+      res.setHeader('Content-Type', 'application/zip');
+      res.setHeader('Content-Disposition', `attachment; filename="${fileName}"`);
+      res.setHeader('Content-Length', String(zipBuf.length));
+      res.setHeader('Cache-Control', 'no-store');
+      res.send(zipBuf);
+    } catch (err) {
+      res.status(500).send(err instanceof Error ? err.message : 'Android APK project build error.');
+    }
+  });
 
   // Real-time 3-Year RHP Financials + Business Strength vs Market Demand Analysis for HD IPO
   app.get('/api/hdipo/financials', async (req, res) => {

@@ -1,4 +1,4 @@
-const CACHE_NAME = "hd-ipo-v22";
+const CACHE_NAME = "hd-ipo-v26";
 const ASSETS = [
   "/",
   "/style.css",
@@ -28,7 +28,7 @@ self.addEventListener("activate", (e) => {
 });
 
 self.addEventListener("fetch", (e) => {
-  if (e.request.method !== "GET" || e.request.url.includes("/api/") || /\.apk(\?|$)/i.test(e.request.url)) return;
+  if (e.request.method !== "GET" || e.request.url.includes("/api/") || /\.(apk|zip)(\?|$)/i.test(e.request.url)) return;
   if (e.request.mode === "navigate") {
     e.respondWith(
       fetch(e.request)
