@@ -1,0 +1,40 @@
+[
+  {
+    "id": 101,
+    "name": "Live Sync Test Energy IPO",
+    "category": "mainboard",
+    "status": "live",
+    "dates": "20 Nov - 23 Nov",
+    "listingDate": "28 Nov",
+    "priceBand": "₹190 - ₹200",
+    "issuePrice": 200,
+    "lotSize": 75,
+    "minInvest": "₹15,000",
+    "issueSize": "₹1,200 Cr",
+    "freshIssue": "85% Fresh / 15% OFS",
+    "ofsPercent": 15,
+    "gmp": 62,
+    "gmpPercent": 31.0,
+    "subscription": { "total": "18.5x", "qib": "28.0x", "nii": "21.4x", "retail": "9.2x" },
+    "qibSub": 28.0,
+    "registrar": "Link Intime",
+    "score": 8.4,
+    "verdict": "APPLY",
+    "listingGain": "Strong (31%)",
+    "shortTerm": "Hold 30 Days",
+    "longTerm": "Good Compounder",
+    "simpleSummary": "Live JSON se aaya hua IPO data! QIB 28x aur Fresh Issue 85% hone se strong listing gain aur hold dono ke liye achha hai.",
+    "plusPoints": ["85% Fresh Issue", "QIB 28x strong demand", "GMP 31% trending up"],
+    "minusPoints": ["Market volatility par nazar rakhein"],
+    "financials": [
+      { "year": "FY24", "revenue": "410 Cr", "profit": "42 Cr", "netWorth": "150 Cr" },
+      { "year": "FY25", "revenue": "620 Cr", "profit": "71 Cr", "netWorth": "225 Cr" },
+      { "year": "FY26", "revenue": "880 Cr", "profit": "112 Cr", "netWorth": "340 Cr" }
+    ],
+    "pe": 22.0,
+    "industryPe": 31.0,
+    "fundamentals": { "peRatio": "22x (Industry: 31x - Sasta)", "roe": "29%", "debtToEquity": "0.18 (Low)" },
+    "smartMoney": { "fiiAllocation": "40% FII in QIB", "anchorInvestors": "Top Mutual Funds", "anchorLockIn30": "28 Dec", "anchorLockIn90": "26 Feb", "marketMood": "Bullish" },
+    "postListing": { "holdingDays": "30-45 Days", "target1": "₹280 (Fair Value)", "target2": "₹310 (QIB Target)", "stopLoss": "₹218 (Anchor Support)", "logic": "Industry P/E 31x ke hisab se ₹280 tak fundamental jagah hai." }
+  }
+]

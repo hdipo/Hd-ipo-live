@@ -1,0 +1,210 @@
+{
+  "entities": {
+    "HdUser": {
+      "title": "HD IPO Registered User",
+      "description": "Registered HD IPO mobile/web user profile with contact mobile number, watchlist sync, and engagement metrics.",
+      "type": "object",
+      "properties": {
+        "uid": {
+          "type": "string",
+          "description": "Firebase Auth UID matching the document ID.",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "name": {
+          "type": "string",
+          "description": "User full name entered during registration.",
+          "minLength": 2,
+          "maxLength": 80
+        },
+        "mobile": {
+          "type": "string",
+          "description": "10-digit Indian mobile number.",
+          "minLength": 10,
+          "maxLength": 10,
+          "pattern": "^[6-9][0-9]{9}$"
+        },
+        "email": {
+          "type": "string",
+          "format": "email",
+          "description": "Verified Google account email.",
+          "maxLength": 150
+        },
+        "photoUrl": {
+          "type": "string",
+          "description": "Optional Google profile photo URL.",
+          "maxLength": 500
+        },
+        "platform": {
+          "type": "string",
+          "description": "Client platform such as Android PWA, iOS PWA, Mobile Web, or Desktop Web.",
+          "maxLength": 40
+        },
+        "savedIds": {
+          "type": "array",
+          "description": "Bounded list of saved IPO IDs (max 100)."
+        },
+        "viewsCount": {
+          "type": "integer",
+          "description": "Count of advance IPO analyses viewed by the user."
+        },
+        "loginCount": {
+          "type": "integer",
+          "description": "Total login sessions recorded for the user."
+        },
+        "lastIpoViewed": {
+          "type": "string",
+          "description": "Name of the most recently viewed IPO.",
+          "maxLength": 120
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp when user registered."
+        },
+        "lastActiveAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp of user's last activity."
+        }
+      },
+      "required": [
+        "uid",
+        "name",
+        "mobile",
+        "email",
+        "photoUrl",
+        "platform",
+        "savedIds",
+        "viewsCount",
+        "loginCount",
+        "lastIpoViewed",
+        "createdAt",
+        "lastActiveAt"
+      ]
+    },
+    "FamilyPanRecord": {
+      "title": "Family PAN Vault Entry",
+      "description": "Private family member PAN entry synced under a registered user's vault.",
+      "type": "object",
+      "properties": {
+        "uid": {
+          "type": "string",
+          "description": "Owner Firebase Auth UID.",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "memberName": {
+          "type": "string",
+          "description": "Family member name.",
+          "minLength": 1,
+          "maxLength": 60
+        },
+        "panNumber": {
+          "type": "string",
+          "description": "10-character Indian PAN.",
+          "minLength": 10,
+          "maxLength": 10,
+          "pattern": "^[A-Z]{5}[0-9]{4}[A-Z]{1}$"
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp when PAN was added."
+        }
+      },
+      "required": ["uid", "memberName", "panNumber", "createdAt"]
+    },
+    "HdActivity": {
+      "title": "IPO Activity Log",
+      "description": "Immutable activity record when a registered user logs in or unlocks advance IPO analysis.",
+      "type": "object",
+      "properties": {
+        "uid": {
+          "type": "string",
+          "description": "Actor Firebase Auth UID.",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "userName": {
+          "type": "string",
+          "description": "Actor display name.",
+          "minLength": 2,
+          "maxLength": 80
+        },
+        "userMobile": {
+          "type": "string",
+          "description": "Actor 10-digit mobile number.",
+          "minLength": 10,
+          "maxLength": 10,
+          "pattern": "^[6-9][0-9]{9}$"
+        },
+        "ipoName": {
+          "type": "string",
+          "description": "IPO name viewed or saved.",
+          "maxLength": 120
+        },
+        "ipoCategory": {
+          "type": "string",
+          "enum": ["mainboard", "sme", "app"],
+          "description": "IPO segment or app event."
+        },
+        "action": {
+          "type": "string",
+          "enum": ["view_advance", "login", "save_ipo"],
+          "description": "Type of user action."
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp of the event."
+        }
+      },
+      "required": ["uid", "userName", "userMobile", "ipoName", "ipoCategory", "action", "createdAt"]
+    },
+    "AdminRecord": {
+      "title": "Admin Allowlist Record",
+      "description": "Authorized admin UID entry.",
+      "type": "object",
+      "properties": {
+        "uid": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "email": {
+          "type": "string",
+          "format": "email",
+          "maxLength": 150
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": ["uid", "email", "createdAt"]
+    }
+  },
+  "firestore": {
+    "/hd_users/{userId}": {
+      "schema": { "$ref": "#/entities/HdUser" },
+      "description": "Registered HD IPO user profiles (owner read/write, admin dashboard list/read)."
+    },
+    "/hd_users/{userId}/family_pans/{panDocId}": {
+      "schema": { "$ref": "#/entities/FamilyPanRecord" },
+      "description": "Private Family PAN vault entries strictly accessible only to the owning user."
+    },
+    "/hd_activity/{activityId}": {
+      "schema": { "$ref": "#/entities/HdActivity" },
+      "description": "Immutable IPO analysis and login activity feed for owner and admin analytics."
+    },
+    "/admins/{adminId}": {
+      "schema": { "$ref": "#/entities/AdminRecord" },
+      "description": "Admin RBAC records managed strictly by bootstrap admin."
+    }
+  }
+}

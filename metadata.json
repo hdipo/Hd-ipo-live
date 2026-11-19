@@ -1,0 +1,6 @@
+{
+  "name": "ChatVault",
+  "description": "Permanently save, organize, search, and sync all your temporary chat conversations and notes in one private vault.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

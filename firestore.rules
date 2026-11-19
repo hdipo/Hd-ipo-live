@@ -1,0 +1,217 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // Global default-deny safety net
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // === GLOBAL PRIMITIVES ===
+    function isValidId(id) {
+      return id is string && id.size() >= 1 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isVerifiedUser() {
+      return isSignedIn() && request.auth.token.email_verified == true;
+    }
+
+    function isOwner(userId) {
+      return isVerifiedUser() && request.auth.uid == userId;
+    }
+
+    // Zero-read bootstrap admin check (safe for allow list queries)
+    function isBootstrapAdmin() {
+      return isVerifiedUser() && request.auth.token.email == 'prajapatih000@gmail.com';
+    }
+
+    // Full admin check for single-document operations
+    function isAdmin() {
+      return isBootstrapAdmin() || (
+        isVerifiedUser() && exists(/databases/$(database)/documents/admins/$(request.auth.uid))
+      );
+    }
+
+    // === VALIDATION BLUEPRINTS ===
+    function isValidSavedIds(listVal) {
+      return listVal is list
+        && listVal.size() <= 100
+        && (listVal.size() == 0 || (listVal[0] is string && listVal[0].size() <= 120));
+    }
+
+    function isValidHdUser(data, userId) {
+      return data.keys().hasAll([
+          'uid', 'name', 'mobile', 'email', 'photoUrl', 'platform',
+          'savedIds', 'viewsCount', 'loginCount', 'lastIpoViewed', 'createdAt', 'lastActiveAt'
+        ])
+        && data.keys().hasOnly([
+          'uid', 'name', 'mobile', 'email', 'photoUrl', 'platform',
+          'savedIds', 'viewsCount', 'loginCount', 'lastIpoViewed', 'createdAt', 'lastActiveAt'
+        ])
+        && isValidId(data.uid)
+        && data.uid == userId
+        && data.name is string && data.name.size() >= 2 && data.name.size() <= 80
+        && data.mobile is string && data.mobile.size() == 10 && data.mobile.matches('^[6-9][0-9]{9}$')
+        && data.email is string && data.email.size() <= 150
+        && data.photoUrl is string && data.photoUrl.size() <= 500
+        && data.platform is string && data.platform.size() >= 1 && data.platform.size() <= 40
+        && isValidSavedIds(data.savedIds)
+        && data.viewsCount is int && data.viewsCount >= 0 && data.viewsCount <= 1000000
+        && data.loginCount is int && data.loginCount >= 1 && data.loginCount <= 1000000
+        && data.lastIpoViewed is string && data.lastIpoViewed.size() <= 120
+        && data.createdAt is timestamp
+        && data.lastActiveAt is timestamp;
+    }
+
+    function isValidFamilyPan(data, userId) {
+      return data.keys().hasAll(['uid', 'memberName', 'panNumber', 'createdAt'])
+        && data.keys().hasOnly(['uid', 'memberName', 'panNumber', 'createdAt'])
+        && isValidId(data.uid)
+        && data.uid == userId
+        && data.memberName is string && data.memberName.size() >= 1 && data.memberName.size() <= 60
+        && data.panNumber is string && data.panNumber.size() == 10 && data.panNumber.matches('^[A-Z]{5}[0-9]{4}[A-Z]{1}$')
+        && data.createdAt is timestamp;
+    }
+
+    function isValidHdActivity(data) {
+      return data.keys().hasAll(['uid', 'userName', 'userMobile', 'ipoName', 'ipoCategory', 'action', 'createdAt'])
+        && data.keys().hasOnly(['uid', 'userName', 'userMobile', 'ipoName', 'ipoCategory', 'action', 'createdAt'])
+        && isValidId(data.uid)
+        && data.uid == request.auth.uid
+        && data.userName is string && data.userName.size() >= 2 && data.userName.size() <= 80
+        && data.userMobile is string && data.userMobile.size() == 10 && data.userMobile.matches('^[6-9][0-9]{9}$')
+        && data.ipoName is string && data.ipoName.size() >= 1 && data.ipoName.size() <= 120
+        && data.ipoCategory is string && data.ipoCategory in ['mainboard', 'sme', 'app']
+        && data.action is string && data.action in ['view_advance', 'login', 'save_ipo']
+        && data.createdAt is timestamp;
+    }
+
+    function isValidAdminRecord(data, adminId) {
+      return data.keys().hasAll(['uid', 'email', 'createdAt'])
+        && data.keys().hasOnly(['uid', 'email', 'createdAt'])
+        && isValidId(data.uid)
+        && data.uid == adminId
+        && data.email is string && data.email.size() >= 3 && data.email.size() <= 150
+        && data.createdAt is timestamp;
+    }
+
+    // === 1. REGISTERED USERS (PII ISOLATED) ===
+    match /hd_users/{userId} {
+      allow get: if isVerifiedUser() && isValidId(userId) && (isOwner(userId) || isAdmin());
+      allow list: if isBootstrapAdmin();
+
+      allow create: if isVerifiedUser()
+        && isValidId(userId)
+        && isOwner(userId)
+        && isValidHdUser(incoming(), userId)
+        && incoming().email == request.auth.token.email
+        && incoming().createdAt == request.time
+        && incoming().lastActiveAt == request.time
+        && incoming().loginCount == 1
+        && incoming().viewsCount == 0;
+
+      allow update: if isVerifiedUser()
+        && isValidId(userId)
+        && isValidHdUser(incoming(), userId)
+        && incoming().uid == existing().uid
+        && incoming().email == existing().email
+        && incoming().createdAt == existing().createdAt
+        && incoming().lastActiveAt == request.time
+        && (
+          isAdmin()
+          || (
+            isOwner(userId)
+            && (
+              // Action 1: Update profile name/mobile/platform
+              incoming().diff(existing()).affectedKeys().hasOnly(['name', 'mobile', 'photoUrl', 'platform', 'lastActiveAt'])
+              // Action 2: Sync saved watchlist
+              || incoming().diff(existing()).affectedKeys().hasOnly(['savedIds', 'lastActiveAt'])
+              // Action 3: Record login or IPO advance view
+              || (
+                incoming().diff(existing()).affectedKeys().hasOnly(['loginCount', 'viewsCount', 'lastIpoViewed', 'platform', 'lastActiveAt'])
+                && incoming().loginCount >= existing().loginCount
+                && incoming().viewsCount >= existing().viewsCount
+              )
+            )
+          )
+        );
+
+      allow delete: if isAdmin() && isValidId(userId);
+
+      // === 2. PRIVATE FAMILY PAN VAULT (MASTER-GATED TO OWNER ONLY) ===
+      match /family_pans/{panDocId} {
+        allow get: if isOwner(userId)
+          && isValidId(userId)
+          && isValidId(panDocId)
+          && exists(/databases/$(database)/documents/hd_users/$(userId));
+
+        allow list: if isOwner(userId) && resource.data.uid == request.auth.uid;
+
+        allow create: if isOwner(userId)
+          && isValidId(userId)
+          && isValidId(panDocId)
+          && isValidFamilyPan(incoming(), userId)
+          && incoming().createdAt == request.time
+          && exists(/databases/$(database)/documents/hd_users/$(userId));
+
+        allow update: if isOwner(userId)
+          && isValidId(userId)
+          && isValidId(panDocId)
+          && isValidFamilyPan(incoming(), userId)
+          && incoming().uid == existing().uid
+          && incoming().createdAt == existing().createdAt
+          && incoming().diff(existing()).affectedKeys().hasOnly(['memberName', 'panNumber'])
+          && exists(/databases/$(database)/documents/hd_users/$(userId));
+
+        allow delete: if isOwner(userId)
+          && isValidId(userId)
+          && isValidId(panDocId)
+          && exists(/databases/$(database)/documents/hd_users/$(userId));
+      }
+    }
+
+    // === 3. ACTIVITY LOGS (IMMUTABLE AUDIT & ANALYTICS) ===
+    match /hd_activity/{activityId} {
+      allow get: if isVerifiedUser()
+        && isValidId(activityId)
+        && (isAdmin() || existing().uid == request.auth.uid);
+
+      allow list: if isVerifiedUser()
+        && (isBootstrapAdmin() || resource.data.uid == request.auth.uid);
+
+      allow create: if isVerifiedUser()
+        && isValidId(activityId)
+        && isValidHdActivity(incoming())
+        && incoming().createdAt == request.time
+        && exists(/databases/$(database)/documents/hd_users/$(request.auth.uid));
+
+      allow update: if false;
+      allow delete: if isAdmin() && isValidId(activityId);
+    }
+
+    // === 4. ADMIN ALLOWLIST ===
+    match /admins/{adminId} {
+      allow get: if isVerifiedUser() && isValidId(adminId) && (isBootstrapAdmin() || request.auth.uid == adminId);
+      allow list: if isBootstrapAdmin();
+      allow create: if isBootstrapAdmin()
+        && isValidId(adminId)
+        && isValidAdminRecord(incoming(), adminId)
+        && incoming().createdAt == request.time;
+      allow update: if false;
+      allow delete: if isBootstrapAdmin() && isValidId(adminId);
+    }
+  }
+}

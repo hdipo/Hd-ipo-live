@@ -1,0 +1,722 @@
+import 'dotenv/config';
+import express from 'express';
+import fs from 'fs';
+import path from 'path';
+import { fileURLToPath } from 'url';
+import { GoogleGenAI } from '@google/genai';
+import { fetchIpoFinancialsReport } from './ipoFinancials.ts';
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
+const PORT = Number(process.env.PORT) || 3000;
+const FALLBACK_GEMINI_MODEL = 'gemini-3.1-flash-lite';
+const LIVE_CACHE_TTL_MS = 5 * 60 * 1000;
+
+interface GroundingSource {
+  title: string;
+  uri: string;
+}
+
+interface MergedLiveIpo {
+  slug: string;
+  companyName: string;
+  detailUrl: string;
+  board: 'mainboard' | 'sme';
+  status: 'open' | 'upcoming' | 'closed' | 'listed';
+  openDate: string;
+  closeDate: string;
+  listingDate: string;
+  priceBand: string;
+  lotSize: number;
+  minInvestment: string;
+  issueSize: string;
+  issueSizeNum: number;
+  pricingMethod: string;
+  freshIssue: string;
+  freshIssuePct: number | null;
+  ofs: string;
+  ofsPct: number | null;
+  subscription: string;
+  subscriptionNum: number | null;
+  subscriptionQib: string;
+  subscriptionSnii: string;
+  subscriptionBnii: string;
+  subscriptionNii: string;
+  subscriptionRetail: string;
+  subscriptionRetailNum: number | null;
+  subscriptionEmployee: string;
+  subscriptionAsOn: string;
+  applications: string;
+  gmp: string;
+  registrar: string;
+  exchange: string;
+  nseSymbol: string;
+  highlight: string;
+  issuePriceNum: number | null;
+  listingOpenPrice: number | null;
+  listingOpenGainPct: number | null;
+  listingClosePrice: number | null;
+  listingCloseGainPct: number | null;
+  currentMarketPrice: string;
+  currentGainPct: number | null;
+  sortTime: number;
+}
+
+interface CachedFeed {
+  fetchedAt: number;
+  asOf: string;
+  allIpos: MergedLiveIpo[];
+  sources: GroundingSource[];
+}
+
+let cachedFeed: CachedFeed | null = null;
+
+function stripHtml(raw: unknown): string {
+  if (typeof raw !== 'string') return '';
+  return raw
+    .replace(/<span[^>]*>.*?<\/span>/gi, '')
+    .replace(/<[^>]+>/g, '')
+    .replace(/&amp;/g, '&')
+    .replace(/&nbsp;/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function stripTagsKeepText(raw: unknown): string {
+  if (typeof raw !== 'string') return '';
+  return raw
+    .replace(/<[^>]+>/g, '')
+    .replace(/&amp;/g, '&')
+    .replace(/&nbsp;/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function extractHref(raw: unknown): string {
+  if (typeof raw !== 'string') return '';
+  const m = raw.match(/href="([^"]+)"/i);
+  return m?.[1] ?? '';
+}
+
+function parseNumberOrNull(val: unknown): number | null {
+  if (val === null || val === undefined || val === '') return null;
+  if (typeof val === 'number') return Number.isFinite(val) ? val : null;
+  const cleaned = String(val).replace(/,/g, '').trim();
+  const num = Number(cleaned);
+  return Number.isFinite(num) ? num : null;
+}
+
+function formatPriceBand(raw: unknown): string {
+  const s = stripHtml(raw);
+  if (!s) return 'TBA';
+  const cleaned = s.replace(/\.00\b/g, '').replace(/\s+to\s+/i, ' - ');
+  return cleaned.startsWith('₹') ? cleaned : `₹${cleaned}`;
+}
+
+function formatMultiple(val: unknown): string {
+  const num = parseNumberOrNull(val);
+  if (num === null) return '—';
+  return `${num.toFixed(2)}x`;
+}
+
+function formatIsoDateShort(iso: unknown, fallback: unknown): string {
+  const fb = stripHtml(fallback);
+  if (fb) return fb;
+  if (typeof iso !== 'string' || !iso) return 'TBA';
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return 'TBA';
+  return d.toLocaleDateString('en-IN', { day: '2-digit', month: 'short', year: 'numeric' });
+}
+
+function parseCmpAndPct(raw: unknown): { cmp: string; pct: number | null } {
+  const text = stripTagsKeepText(raw);
+  if (!text) return { cmp: '—', pct: null };
+  const priceMatch = text.match(/([\d,]+\.?\d*)/);
+  const pctMatch = text.match(/\(([-+]?\d+(?:\.\d+)?)%\)/);
+  const cmp = priceMatch ? `₹${priceMatch[1]}` : text;
+  const pct = pctMatch ? Number(pctMatch[1]) : null;
+  return { cmp, pct: pct !== null && Number.isFinite(pct) ? pct : null };
+}
+
+function computeIpoStatus(row: Record<string, unknown>, nowMs: number): 'open' | 'upcoming' | 'closed' | 'listed' {
+  const highlight = String(row['~Highlight_Row'] ?? '').toLowerCase();
+  if (highlight.includes('green')) return 'open';
+
+  const openIso = String(row['~Issue_Open_Date'] ?? '');
+  const closeIso = String(row['~IssueCloseDate'] ?? '');
+  const listIso = String(row['~ListingDate'] ?? '');
+
+  const openMs = openIso ? Date.parse(openIso) : NaN;
+  const closeEndMs = closeIso ? Date.parse(closeIso) + 24 * 60 * 60 * 1000 : NaN;
+  const listMs = listIso ? Date.parse(listIso) : NaN;
+
+  if (Number.isFinite(openMs) && Number.isFinite(closeEndMs)) {
+    if (nowMs >= openMs && nowMs <= closeEndMs) return 'open';
+    if (nowMs < openMs) return 'upcoming';
+    if (Number.isFinite(listMs) && nowMs >= listMs) return 'listed';
+    return 'closed';
+  }
+
+  if (Number.isFinite(openMs) && nowMs < openMs) return 'upcoming';
+  if (Number.isFinite(listMs) && nowMs >= listMs) return 'listed';
+  return 'closed';
+}
+
+function getIndianFyParams(now: Date) {
+  const month = now.getMonth() + 1;
+  const year = now.getFullYear();
+  const fy =
+    month >= 4
+      ? `${year}-${String(year + 1).slice(-2)}`
+      : `${year - 1}-${String(year).slice(-2)}`;
+  return { month, year, fy };
+}
+
+async function fetchJsonSafe(url: string): Promise<Record<string, unknown>[]> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 9000);
+  try {
+    const res = await fetch(url, {
+      signal: controller.signal,
+      headers: {
+        'User-Agent':
+          'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
+        Accept: 'application/json',
+        Referer: 'https://www.chittorgarh.com/',
+      },
+    });
+    if (!res.ok) return [];
+    const data = (await res.json()) as { reportTableData?: Record<string, unknown>[] };
+    return Array.isArray(data?.reportTableData) ? data.reportTableData : [];
+  } catch {
+    return [];
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function getLiveChittorgarhFeed(forceRefresh = false): Promise<CachedFeed> {
+  const now = new Date();
+  const nowMs = now.getTime();
+  if (!forceRefresh && cachedFeed && nowMs - cachedFeed.fetchedAt < LIVE_CACHE_TTL_MS) {
+    return cachedFeed;
+  }
+
+  const { month, year, fy } = getIndianFyParams(now);
+  const baseUrl = `https://webnodejs.chittorgarh.com/cloud/report/data-read`;
+  const listUrl = `${baseUrl}/82/1/${month}/${year}/${fy}/0/all/0`;
+  const mainSubUrl = `${baseUrl}/21/1/${month}/${year}/${fy}/0/mainboard/0`;
+  const smeSubUrl = `${baseUrl}/21/1/${month}/${year}/${fy}/0/sme/0`;
+  const perfUrl = `${baseUrl}/125/1/${month}/${year}/${fy}/0/all/0`;
+
+  const [ipoRows, mainSubRows, smeSubRows, perfRows] = await Promise.all([
+    fetchJsonSafe(listUrl),
+    fetchJsonSafe(mainSubUrl),
+    fetchJsonSafe(smeSubUrl),
+    fetchJsonSafe(perfUrl),
+  ]);
+
+  if (ipoRows.length === 0) {
+    throw new Error(
+      'Unable to reach live IPO market feed right now. Please try refreshing in a moment.'
+    );
+  }
+
+  const subBySlug = new Map<string, Record<string, unknown>>();
+  for (const row of [...mainSubRows, ...smeSubRows]) {
+    const slug = String(row['~URLRewrite_Folder_Name'] ?? '').trim().toLowerCase();
+    if (slug) subBySlug.set(slug, row);
+  }
+
+  const perfBySlug = new Map<string, Record<string, unknown>>();
+  for (const row of perfRows) {
+    const slug = String(row['~URLRewrite_Folder_Name'] ?? '').trim().toLowerCase();
+    if (slug) perfBySlug.set(slug, row);
+  }
+
+  const merged: MergedLiveIpo[] = ipoRows.map((row) => {
+    const slug = String(row['~URLRewrite_Folder_Name'] ?? '').trim().toLowerCase();
+    const sub = slug ? subBySlug.get(slug) : undefined;
+    const perf = slug ? perfBySlug.get(slug) : undefined;
+
+    const companyName = stripHtml(row['Company']) || stripHtml(row['~IPO']) || 'Unnamed IPO';
+    const detailUrl = extractHref(row['Company']);
+    const categoryRaw = String(row['Issue Category'] ?? '').toLowerCase();
+    const board: 'mainboard' | 'sme' = categoryRaw.includes('sme') ? 'sme' : 'mainboard';
+
+    let status = computeIpoStatus(row, nowMs);
+    if (perf && parseNumberOrNull(perf['Close Price on Listing (Rs.)']) !== null) {
+      status = 'listed';
+    }
+
+    const openDate = formatIsoDateShort(row['~Issue_Open_Date'], row['Opening Date']);
+    const closeDate = formatIsoDateShort(row['~IssueCloseDate'], row['Closing Date']);
+    const listingDate = formatIsoDateShort(
+      row['~ListingDate'] || perf?.['~IPO_listing_date'],
+      row['Listing Date'] || perf?.['Listing Date']
+    );
+
+    const issueCrRaw = stripHtml(row['Total Issue Amount (Incl.Firm reservations) (Rs.cr.)']);
+    const issueSizeNum = parseNumberOrNull(issueCrRaw) ?? 0;
+    const issueSize = issueCrRaw ? `₹${issueCrRaw} Cr` : 'TBA';
+
+    const freshCrRaw = stripHtml(row['Fresh Capital (Rs.cr.)']);
+    const freshIssue = freshCrRaw ? `₹${freshCrRaw} Cr` : '—';
+    const freshIssuePct = parseNumberOrNull(row['Fresh Capital as % of Issue Amount']);
+
+    const ofsCrRaw = stripHtml(row['Offer for sale (Rs.cr.)']);
+    const ofs = ofsCrRaw ? `₹${ofsCrRaw} Cr` : '—';
+    const ofsPct = parseNumberOrNull(row['Offer for sale as % of Issue Amount']);
+
+    const pricingMethod = stripHtml(row['Pricing Method']) || 'Bookbuilding';
+    const exchange = stripHtml(row['Listing at']) || (board === 'sme' ? 'NSE/BSE SME' : 'NSE, BSE');
+    const leadManager = stripHtml(row['Left Lead Manager']);
+    const nseSymbol = String(row['~nse_symbol'] || perf?.['~nse_symbol'] || '').trim();
+
+    const subNum = sub
+      ? parseNumberOrNull(sub['Total (x)'])
+      : perf
+      ? parseNumberOrNull(perf['Subscription (x)'])
+      : null;
+    const subTotal =
+      subNum !== null
+        ? `${subNum.toFixed(2)}x`
+        : status === 'upcoming'
+        ? 'Upcoming'
+        : '—';
+
+    const subQib = sub ? formatMultiple(sub['QIB (x)']) : '—';
+    const subSnii = sub ? formatMultiple(sub['sNII (x)']) : '—';
+    const subBnii = sub ? formatMultiple(sub['bNII (x)']) : '—';
+    const subNii = sub ? formatMultiple(sub['NII (x)']) : '—';
+    const subRetailNum = sub ? parseNumberOrNull(sub['Retail (x)']) : null;
+    const subRetail = subRetailNum !== null ? `${subRetailNum.toFixed(2)}x` : '—';
+    const subEmployee = sub ? formatMultiple(sub['Employee (x)']) : '—';
+    const subscriptionAsOn = sub ? stripHtml(sub['Subscription as on']) : '';
+    const applications = sub && sub['Applications'] ? String(sub['Applications']) : '';
+
+    // Listing performance fields
+    const issuePriceNum = perf ? parseNumberOrNull(perf['Issue Price (Rs.)']) : null;
+    const listingOpenPrice = perf ? parseNumberOrNull(perf['Open Price on Listing (Rs.)']) : null;
+    let listingOpenGainPct = perf
+      ? parseNumberOrNull(perf['% Gain / Loss (Issue price v/s Open price on Listing)'])
+      : null;
+    if (
+      listingOpenGainPct === null &&
+      issuePriceNum !== null &&
+      issuePriceNum > 0 &&
+      listingOpenPrice !== null
+    ) {
+      listingOpenGainPct = Number(
+        (((listingOpenPrice - issuePriceNum) / issuePriceNum) * 100).toFixed(2)
+      );
+    }
+
+    const listingClosePrice = perf ? parseNumberOrNull(perf['Close Price on Listing (Rs.)']) : null;
+    let listingCloseGainPct = perf
+      ? parseNumberOrNull(perf['% Gain / Loss (Issue price v/s Close price on Listing)'])
+      : null;
+    if (
+      listingCloseGainPct === null &&
+      issuePriceNum !== null &&
+      issuePriceNum > 0 &&
+      listingClosePrice !== null
+    ) {
+      listingCloseGainPct = Number(
+        (((listingClosePrice - issuePriceNum) / issuePriceNum) * 100).toFixed(2)
+      );
+    }
+
+    const { cmp: currentMarketPrice, pct: currentGainPct } = perf
+      ? parseCmpAndPct(perf['Market Price (Rs.)'])
+      : { cmp: '—', pct: null };
+
+    const openTs = Date.parse(String(row['~Issue_Open_Date'] ?? ''));
+    const sortTime = Number.isFinite(openTs) ? openTs : 0;
+
+    return {
+      slug,
+      companyName,
+      detailUrl,
+      board,
+      status,
+      openDate,
+      closeDate,
+      listingDate,
+      priceBand: formatPriceBand(row['Issue Price (Rs.)']),
+      lotSize: 0,
+      minInvestment: '—',
+      issueSize,
+      issueSizeNum,
+      pricingMethod,
+      freshIssue,
+      freshIssuePct,
+      ofs,
+      ofsPct,
+      subscription: subTotal,
+      subscriptionNum: subNum,
+      subscriptionQib: subQib,
+      subscriptionSnii: subSnii,
+      subscriptionBnii: subBnii,
+      subscriptionNii: subNii,
+      subscriptionRetail: subRetail,
+      subscriptionRetailNum: subRetailNum,
+      subscriptionEmployee: subEmployee,
+      subscriptionAsOn,
+      applications,
+      gmp: applications ? `${applications} bids` : exchange,
+      registrar: leadManager || exchange,
+      exchange,
+      nseSymbol,
+      highlight: [
+        exchange,
+        leadManager ? `Lead Manager: ${leadManager}` : '',
+        applications ? `Applications: ${applications}` : '',
+      ]
+        .filter(Boolean)
+        .join(' · '),
+      issuePriceNum,
+      listingOpenPrice,
+      listingOpenGainPct,
+      listingClosePrice,
+      listingCloseGainPct,
+      currentMarketPrice,
+      currentGainPct,
+      sortTime,
+    };
+  });
+
+  const rank: Record<MergedLiveIpo['status'], number> = {
+    open: 0,
+    upcoming: 1,
+    closed: 2,
+    listed: 3,
+  };
+
+  merged.sort((a, b) => {
+    if (rank[a.status] !== rank[b.status]) return rank[a.status] - rank[b.status];
+    if (a.status === 'upcoming') return a.sortTime - b.sortTime;
+    return b.sortTime - a.sortTime;
+  });
+
+  const feed: CachedFeed = {
+    fetchedAt: nowMs,
+    asOf: now.toISOString().slice(0, 10),
+    allIpos: merged,
+    sources: [
+      {
+        title: 'Chittorgarh Live IPO Calendar (Mainboard & SME)',
+        uri: 'https://www.chittorgarh.com/report/ipo-in-india-list-main-board-sme/82/',
+      },
+      {
+        title: 'Chittorgarh Live IPO Subscription Status',
+        uri: 'https://www.chittorgarh.com/report/ipo-subscription-status-live-bidding-data-bse-nse/21/',
+      },
+      {
+        title: 'Chittorgarh IPO Listing Day Performance',
+        uri: 'https://www.chittorgarh.com/report/ipo-performance-tracker-in-india/125/',
+      },
+    ],
+  };
+
+  cachedFeed = feed;
+  return feed;
+}
+
+function getAiClient(): GoogleGenAI | null {
+  const apiKey = process.env.GEMINI_API_KEY;
+  if (!apiKey) return null;
+  return new GoogleGenAI({
+    apiKey,
+    httpOptions: {
+      headers: {
+        'User-Agent': 'aistudio-build',
+      },
+    },
+  });
+}
+
+function extractGroundingSources(response: unknown): GroundingSource[] {
+  const resp = response as {
+    candidates?: Array<{
+      groundingMetadata?: {
+        groundingChunks?: Array<{
+          web?: { uri?: string; title?: string };
+        }>;
+      };
+    }>;
+  };
+  const chunks = resp?.candidates?.[0]?.groundingMetadata?.groundingChunks ?? [];
+  const seen = new Set<string>();
+  const sources: GroundingSource[] = [];
+  for (const chunk of chunks) {
+    const uri = chunk?.web?.uri;
+    const title = chunk?.web?.title || uri || 'Source';
+    if (uri && !seen.has(uri)) {
+      seen.add(uri);
+      sources.push({ title, uri });
+    }
+  }
+  return sources.slice(0, 8);
+}
+
+function extractJsonBlock(rawText: string): string {
+  const trimmed = rawText.trim();
+  const fenced = trimmed.match(/```(?:json)?\s*([\s\S]*?)```/i);
+  if (fenced && fenced[1]) return fenced[1].trim();
+  const firstBrace = trimmed.indexOf('{');
+  const lastBrace = trimmed.lastIndexOf('}');
+  if (firstBrace !== -1 && lastBrace > firstBrace) {
+    return trimmed.slice(firstBrace, lastBrace + 1);
+  }
+  return trimmed;
+}
+
+async function startServer() {
+  const app = express();
+  app.use(express.json({ limit: '1mb' }));
+
+  app.get('/api/health', (_req, res) => {
+    res.json({ ok: true });
+  });
+
+  app.get('/manifest.json', (_req, res) => {
+    const prodFile = path.resolve(__dirname, 'dist', 'manifest.json');
+    const devFile = path.resolve(__dirname, 'public', 'manifest.json');
+    const target = fs.existsSync(prodFile) ? prodFile : devFile;
+    res.setHeader('Content-Type', 'application/manifest+json; charset=utf-8');
+    res.setHeader('Cache-Control', 'no-cache');
+    res.sendFile(target);
+  });
+
+  app.get('/sw.js', (_req, res) => {
+    const prodFile = path.resolve(__dirname, 'dist', 'sw.js');
+    const devFile = path.resolve(__dirname, 'public', 'sw.js');
+    const target = fs.existsSync(prodFile) ? prodFile : devFile;
+    res.setHeader('Content-Type', 'application/javascript; charset=utf-8');
+    res.setHeader('Service-Worker-Allowed', '/');
+    res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
+    res.sendFile(target);
+  });
+
+  // Real-time 3-Year RHP Financials + Business Strength vs Market Demand Analysis for HD IPO
+  app.get('/api/hdipo/financials', async (req, res) => {
+    const name = typeof req.query.name === 'string' ? req.query.name.trim() : '';
+    const slug = typeof req.query.slug === 'string' ? req.query.slug.trim() : '';
+    if (!name && !slug) {
+      res.status(400).json({ found: false, error: 'Missing IPO name or slug.' });
+      return;
+    }
+    try {
+      const report = await fetchIpoFinancialsReport(name, slug);
+      if (!report) {
+        res.status(404).json({
+          found: false,
+          error: 'Is IPO ka 3-year RHP financial table abhi exchange directory mein available nahi hai.',
+        });
+        return;
+      }
+      res.json(report);
+    } catch (err) {
+      console.error('HD IPO financials error:', err);
+      res.status(502).json({
+        found: false,
+        error: 'Financial data load nahi ho saka. Thodi der baad dobara try karein.',
+      });
+    }
+  });
+
+  // Live Indian IPO Feed (direct real-time NSE/BSE Mainboard & SME data + live subscription + listing performance)
+  app.get('/api/ipo/live', async (req, res) => {
+    const category =
+      typeof req.query.category === 'string' ? req.query.category.toLowerCase() : 'all';
+    const force = req.query.force === '1' || req.query.force === 'true';
+
+    try {
+      const feed = await getLiveChittorgarhFeed(force);
+      const filtered =
+        category === 'mainboard'
+          ? feed.allIpos.filter((i) => i.board === 'mainboard')
+          : category === 'sme'
+          ? feed.allIpos.filter((i) => i.board === 'sme')
+          : feed.allIpos;
+
+      const openCount = filtered.filter((i) => i.status === 'open').length;
+      const upcomingCount = filtered.filter((i) => i.status === 'upcoming').length;
+
+      const activeAndRecent = [
+        ...filtered.filter((i) => i.status === 'open' || i.status === 'upcoming'),
+        ...filtered.filter((i) => i.status === 'closed' || i.status === 'listed').slice(0, 40),
+      ];
+
+      const listedPerformance = filtered
+        .filter((i) => i.status === 'listed' && i.listingClosePrice !== null)
+        .slice(0, 40);
+
+      // Compute real KPIs
+      const withSub = activeAndRecent.filter((i) => i.subscriptionNum !== null && i.subscriptionNum > 0);
+      const topSub = withSub.sort((a, b) => (b.subscriptionNum ?? 0) - (a.subscriptionNum ?? 0))[0];
+
+      const gainsForAvg = listedPerformance
+        .slice(0, 20)
+        .map((i) => i.listingCloseGainPct)
+        .filter((v): v is number => v !== null && Number.isFinite(v));
+      const avgListingGainPct =
+        gainsForAvg.length > 0
+          ? Number((gainsForAvg.reduce((a, b) => a + b, 0) / gainsForAvg.length).toFixed(1))
+          : null;
+
+      res.json({
+        asOf: feed.asOf,
+        marketSummary: `${openCount} IPO${openCount === 1 ? '' : 's'} currently open for bidding and ${upcomingCount} upcoming across NSE/BSE.`,
+        metrics: {
+          openCount,
+          upcomingCount,
+          listedCount: listedPerformance.length,
+          topSubscribedName: topSub ? topSub.companyName : '—',
+          topSubscribedValue: topSub ? topSub.subscription : '—',
+          avgListingGainPct,
+        },
+        ipos: activeAndRecent,
+        listedPerformance,
+        sources: feed.sources,
+        fetchedAt: new Date(feed.fetchedAt).toISOString(),
+      });
+    } catch (error) {
+      console.error('Live IPO feed error:', error);
+      const message =
+        error instanceof Error ? error.message : 'Unable to fetch live IPO data right now.';
+      res.status(502).json({ error: message });
+    }
+  });
+
+  // Live IPO Lookup: checks live Chittorgarh directory first (instant, zero quota), falls back to Gemini Search Grounding only if not found
+  app.post('/api/ipo/lookup', async (req, res) => {
+    const queryText =
+      typeof req.body?.query === 'string' ? req.body.query.trim().slice(0, 120) : '';
+    if (!queryText) {
+      res.status(400).json({ error: 'Please enter an IPO name to look up.' });
+      return;
+    }
+
+    try {
+      const feed = await getLiveChittorgarhFeed(false);
+      const qLower = queryText.toLowerCase();
+      const match =
+        feed.allIpos.find((i) => i.companyName.toLowerCase() === qLower) ||
+        feed.allIpos.find((i) => i.companyName.toLowerCase().includes(qLower)) ||
+        feed.allIpos.find((i) => i.slug.includes(qLower.replace(/\s+/g, '-')));
+
+      if (match) {
+        res.json({
+          ipo: {
+            companyName: match.companyName,
+            board: match.board,
+            status: match.status,
+            openDate: match.openDate,
+            closeDate: match.closeDate,
+            allotmentDate: 'Check registrar after close',
+            listingDate: match.listingDate,
+            priceBand: match.priceBand,
+            lotSize: match.lotSize,
+            minInvestment: match.minInvestment,
+            issueSize: match.issueSize,
+            gmp: match.gmp,
+            subscriptionTotal: match.subscription,
+            subscriptionQib: match.subscriptionQib,
+            subscriptionNii: match.subscriptionNii,
+            subscriptionRetail: match.subscriptionRetail,
+            registrar: match.registrar,
+            overview: `${match.companyName} is a ${
+              match.board === 'sme' ? 'SME' : 'Mainboard'
+            } IPO (${match.exchange}, ${match.pricingMethod}) with total issue size ${match.issueSize} (Fresh: ${match.freshIssue}, OFS: ${match.ofs}) and price band ${
+              match.priceBand
+            }.${match.applications ? ` Total applications received: ${match.applications}.` : ''}${
+              match.listingClosePrice !== null
+                ? ` Listed at ₹${match.listingOpenPrice ?? match.listingClosePrice} (Day close: ₹${match.listingClosePrice}, ${match.listingCloseGainPct ?? 0}%).`
+                : ''
+            }`,
+          },
+          sources: [
+            ...(match.detailUrl
+              ? [{ title: `${match.companyName} — Live IPO Details`, uri: match.detailUrl }]
+              : []),
+            ...feed.sources,
+          ],
+          fetchedAt: new Date(feed.fetchedAt).toISOString(),
+        });
+        return;
+      }
+
+      const ai = getAiClient();
+      if (!ai) {
+        res.status(404).json({
+          error: `No live IPO matching "${queryText}" was found in the current NSE/BSE IPO directory.`,
+        });
+        return;
+      }
+
+      const todayIso = new Date().toISOString().slice(0, 10);
+      const prompt = [
+        `Search the web for the latest live IPO details for "${queryText}" in India (as of ${todayIso}).`,
+        'Return ONLY a valid JSON object with fields: companyName, board ("mainboard"|"sme"), status ("open"|"upcoming"|"closed"|"listed"), openDate, closeDate, allotmentDate, listingDate, priceBand, lotSize (number), minInvestment, issueSize, gmp, subscriptionTotal, subscriptionQib, subscriptionNii, subscriptionRetail, registrar, overview.',
+      ].join('\n');
+
+      const response = await ai.models.generateContent({
+        model: FALLBACK_GEMINI_MODEL,
+        contents: prompt,
+        config: {
+          tools: [{ googleSearch: {} }],
+        },
+      });
+
+      const parsed = JSON.parse(extractJsonBlock(response.text ?? '')) as Record<string, unknown>;
+      res.json({
+        ipo: parsed,
+        sources: extractGroundingSources(response),
+        fetchedAt: new Date().toISOString(),
+      });
+    } catch (error) {
+      const rawMsg = error instanceof Error ? error.message : String(error);
+      if (rawMsg.includes('429') || rawMsg.includes('RESOURCE_EXHAUSTED')) {
+        res.status(429).json({
+          error:
+            'Search quota limit reached on the current API key. Try searching an active IPO from the live table, or select a billing-enabled API key in Settings > Secrets.',
+        });
+        return;
+      }
+      console.error('IPO lookup error:', error);
+      res.status(502).json({
+        error: `Could not find live IPO details for "${queryText}". Try a shorter company name.`,
+      });
+    }
+  });
+
+  const isProd = process.env.NODE_ENV === 'production';
+  if (!isProd) {
+    const { createServer: createViteServer } = await import('vite');
+    const vite = await createViteServer({
+      server: { middlewareMode: true },
+      appType: 'spa',
+    });
+    app.use(vite.middlewares);
+  } else {
+    const distDir = path.resolve(__dirname, 'dist');
+    app.use(express.static(distDir));
+    app.get('*', (_req, res) => {
+      const indexFile = path.join(distDir, 'index.html');
+      if (fs.existsSync(indexFile)) {
+        res.sendFile(indexFile);
+      } else {
+        res.status(404).send('Build output not found. Run npm run build first.');
+      }
+    });
+  }
+
+  app.listen(PORT, '0.0.0.0', () => {
+    console.log(`Server listening on http://0.0.0.0:${PORT}`);
+  });
+}
+
+void startServer();
