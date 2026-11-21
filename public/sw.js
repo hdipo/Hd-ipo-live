@@ -1,4 +1,4 @@
-const CACHE_NAME = "hd-ipo-v26";
+const CACHE_NAME = "hd-ipo-v33";
 const ASSETS = [
   "/",
   "/style.css",

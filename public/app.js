@@ -596,9 +596,56 @@ function mapOfficialRecord(item, subObj, metaObj) {
   return runAutoAnalyst(mapped);
 }
 
-// 100% AUTOMATIC LIVE + PAST + FUTURE SYNC
+// 100% AUTOMATIC LIVE + PAST + FUTURE SYNC (Works on Web AND Pure Standalone Android APK)
 let lastLiveSyncMs = 0;
 let isSyncingLive = false;
+
+const isNativeApkRuntime =
+  window.location.protocol === "file:" ||
+  Boolean(window.HdAndroid) ||
+  /HDIPOApp\//i.test(navigator.userAgent || "");
+
+window.__hdNativeCbs = window.__hdNativeCbs || {};
+let __hdNativeSeq = 1;
+
+function hdFetchText(url, referer = "") {
+  if (window.HdAndroid && typeof window.HdAndroid.fetchUrlAsync === "function") {
+    return new Promise((resolve) => {
+      const cbId = "cb_" + (__hdNativeSeq++);
+      const timer = setTimeout(() => {
+        delete window.__hdNativeCbs[cbId];
+        resolve({ ok: false, text: async () => "", json: async () => { throw new Error("timeout"); } });
+      }, 16000);
+      window.__hdNativeCbs[cbId] = (ok, bodyText) => {
+        clearTimeout(timer);
+        delete window.__hdNativeCbs[cbId];
+        const raw = typeof bodyText === "string" ? bodyText : "";
+        resolve({
+          ok: Boolean(ok) && raw.length > 0,
+          text: async () => raw,
+          json: async () => JSON.parse(raw),
+        });
+      };
+      try {
+        window.HdAndroid.fetchUrlAsync(cbId, String(url), String(referer || ""));
+      } catch (_) {
+        clearTimeout(timer);
+        delete window.__hdNativeCbs[cbId];
+        resolve({ ok: false, text: async () => "", json: async () => { throw new Error("bridge"); } });
+      }
+    });
+  }
+  return fetch(url);
+}
+
+async function fetchStandaloneApkLiveMeta(forceRefresh = false) {
+  if (typeof window.fetchNativeFullCardsMeta === "function") {
+    return window.fetchNativeFullCardsMeta(Boolean(forceRefresh));
+  }
+  return Array.isArray(window.HD_BUNDLED_CARDS_META)
+    ? window.HD_BUNDLED_CARDS_META.map((x) => ({ ...x }))
+    : [];
+}
 
 async function syncLiveData(manualClick = false, silentAuto = false) {
   if (isSyncingLive && !manualClick) return;
@@ -607,19 +654,27 @@ async function syncLiveData(manualClick = false, silentAuto = false) {
   if (btn && !silentAuto) btn.innerHTML = `<span class="dot"></span> SYNCING...`;
   try {
     const [idxRes, subRes, metaRes] = await Promise.all([
-      fetch("https://ipos.markets/data/issues_index.json?v=" + Date.now()),
-      fetch("https://ipos.markets/api/v1/subscription?v=" + Date.now()).catch(() => null),
-      fetch(`/api/hdipo/cards-meta${manualClick ? "?force=1&v=" : "?v="}${Date.now()}`).catch(() => null)
+      hdFetchText("https://ipos.markets/data/issues_index.json?v=" + Date.now()).catch(() => null),
+      hdFetchText("https://ipos.markets/api/v1/subscription?v=" + Date.now()).catch(() => null),
+      isNativeApkRuntime
+        ? Promise.resolve(null)
+        : fetch(`/api/hdipo/cards-meta${manualClick ? "?force=1&v=" : "?v="}${Date.now()}`).catch(() => null)
     ]);
 
-    if (!idxRes.ok) throw new Error("Feed error");
-    const rawIdx = await idxRes.json();
+    let rawIdx = null;
+    if (idxRes && idxRes.ok) {
+      rawIdx = await idxRes.json().catch(() => null);
+    }
+    if (!rawIdx && Array.isArray(window.HD_BUNDLED_INDEX) && window.HD_BUNDLED_INDEX.length) {
+      rawIdx = window.HD_BUNDLED_INDEX;
+    }
+    if (!rawIdx) throw new Error("Feed error");
     const list = Array.isArray(rawIdx) ? rawIdx : (rawIdx.issues || rawIdx.data || Object.values(rawIdx));
 
     const subMap = {};
     if (subRes && subRes.ok) {
-      const rawSub = await subRes.json();
-      const sList = Array.isArray(rawSub) ? rawSub : (rawSub.issues || []);
+      const rawSub = await subRes.json().catch(() => null);
+      const sList = Array.isArray(rawSub) ? rawSub : (rawSub?.issues || []);
       sList.forEach(s => {
         if (s.slug) subMap[s.slug] = s;
         if (s.symbol) subMap[s.symbol] = s;
@@ -627,7 +682,12 @@ async function syncLiveData(manualClick = false, silentAuto = false) {
     }
 
     const metaMap = new Map();
-    if (metaRes && metaRes.ok) {
+    if (isNativeApkRuntime) {
+      const mList = await fetchStandaloneApkLiveMeta(manualClick);
+      mList.forEach(m => {
+        if (m && m.normName) metaMap.set(m.normName, m);
+      });
+    } else if (metaRes && metaRes.ok) {
       const rawMeta = await metaRes.json();
       const mList = Array.isArray(rawMeta.items) ? rawMeta.items : [];
       mList.forEach(m => {
@@ -894,11 +954,27 @@ function renderIPOs() {
   const totalCount = filtered.length;
   const shown = filtered.slice(0, visibleIpoLimit);
   const showBanner = !isStandaloneApp && !sessionStorage.getItem("hdInstallBannerDismissed");
-  const cfg = (window.hdAuth && window.hdAuth.appConfig) ? window.hdAuth.appConfig : { apkUrl: "", appVersion: "v1.0" };
-  const verLabel = cfg.appVersion || "v1.0";
-  const hasApk = hasAnyApkAvailable(cfg);
+  const cfg = getAppConfigSafe();
+  const verLabel = cfg.appVersion || "v1.2";
+  const localVerLabel = getLocalAppVersion(verLabel);
+  const hasNativeUpdateAvailable = Boolean(
+    isStandaloneApp &&
+    cfg.loaded &&
+    hasAnyApkAvailable(cfg) &&
+    compareAppVersions(verLabel, localVerLabel) > 0
+  );
   const bannerShareSvg = `<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="18" cy="5" r="3"></circle><circle cx="6" cy="12" r="3"></circle><circle cx="18" cy="19" r="3"></circle><line x1="8.59" y1="13.51" x2="15.42" y2="17.49"></line><line x1="15.41" y1="6.51" x2="8.59" y2="10.49"></line></svg>`;
-  const installBannerHtml = showBanner ? `
+  const installBannerHtml = hasNativeUpdateAvailable ? `
+    <div class="install-banner" style="background:linear-gradient(135deg,#eff6ff,#dbeafe);border-color:#93c5fd;">
+      <div class="install-banner-left">
+        <b style="color:#1e3a8a;">Update Available (${escapeHtml(verLabel)})</b>
+        <small style="color:#1d4ed8;">${escapeHtml(cfg.updateNotes || "New features & improvements ready")}</small>
+      </div>
+      <div style="display:flex;align-items:center;gap:6px;flex-shrink:0;">
+        <button class="btn-analyze" style="background:#15803d;" onclick="openUpdatePopup(false)">Update</button>
+      </div>
+    </div>
+  ` : (showBanner ? `
     <div class="install-banner">
       <div class="install-banner-left">
         <b>HD IPO Live App</b>
@@ -910,15 +986,26 @@ function renderIPOs() {
         <button class="banner-close" onclick="sessionStorage.setItem('hdInstallBannerDismissed','1');renderIPOs();" aria-label="Close">✕</button>
       </div>
     </div>
-  ` : "";
+  ` : "");
 
-  const note = q
-    ? `<p style="font-size:11.5px;color:#1d4ed8;margin-bottom:8px;">Search Results across Past, Live & Future: <b>${totalCount}</b> found</p>`
+  const freshLabel = (() => {
+    if (!lastLiveSyncMs) return "";
+    const secs = Math.max(0, Math.round((Date.now() - lastLiveSyncMs) / 1000));
+    if (secs < 25) return "● Live • Just now";
+    if (secs < 60) return `● Live • ${secs}s ago`;
+    const mins = Math.round(secs / 60);
+    return mins < 60 ? `● Live • ${mins}m ago` : "";
+  })();
+  const freshTagHtml = freshLabel ? `<span class="live-fresh-tag">${freshLabel}</span>` : "";
+
+  const noteText = q
+    ? `Search Results across Past, Live & Future: <b>${totalCount}</b> found`
     : (currentTab === "upcoming"
-      ? `<p style="font-size:11.5px;color:#475569;margin-bottom:8px;">Showing <b>${totalCount}</b> High-Chance Upcoming IPOs (Date Confirmed + Shareholder Quota + SEBI Approved)</p>`
+      ? `Showing <b>${totalCount}</b> High-Chance Upcoming IPOs`
       : (totalCount > shown.length
-        ? `<p style="font-size:11.5px;color:#475569;margin-bottom:8px;">Showing <b>${shown.length}</b> of <b>${totalCount}</b> IPOs — niche <b>Load More</b> dabayein ya upar Search karein!</p>`
-        : `<p style="font-size:11.5px;color:#64748b;margin-bottom:8px;">Total <b>${totalCount}</b> IPOs loaded</p>`));
+        ? `Showing <b>${shown.length}</b> of <b>${totalCount}</b> IPOs`
+        : `Total <b>${totalCount}</b> IPOs loaded`));
+  const note = `<div class="live-freshness-row"><span>${noteText}</span>${freshTagHtml}</div>`;
 
   const loadMoreHtml = totalCount > shown.length
     ? `<div style="text-align:center;margin:14px 0 22px;"><button class="btn-analyze" style="height:38px;padding:0 20px;font-size:13px;" onclick="loadMoreIPOs()">Load More IPOs (${totalCount - shown.length} remaining) ↓</button></div>`
@@ -1214,7 +1301,7 @@ function shareSingleIpo(id) {
     <div class="hd-popup-card">
       <button class="hd-popup-x" onclick="closePopupOverlay()" aria-label="Close">✕</button>
       <div class="hd-popup-brand">
-        <img src="/pwa-192x192.png" alt="HD IPO" class="hd-popup-icon">
+        <img src="pwa-192x192.png" alt="HD IPO" class="hd-popup-icon">
         <div>
           <div class="hd-popup-badge">SHARE IPO UPDATE</div>
           <h3 class="hd-popup-title">${escapeHtml(displayName)}</h3>
@@ -1351,6 +1438,10 @@ function deleteFamilyPan(idx) {
 function openRegistrarWithPan(pan) {
   copyTextSafe(pan);
   showNotice("PAN Copied: " + pan + " — Website par Paste karein!");
+  if (window.HdAndroid && typeof window.HdAndroid.openExternalUrl === "function") {
+    window.HdAndroid.openExternalUrl(selectedRegistrar);
+    return;
+  }
   const a = document.createElement("a");
   a.href = selectedRegistrar;
   a.target = "_blank";
@@ -1461,6 +1552,21 @@ function applyFinancialsReportToIpo(ipo, finData) {
   return true;
 }
 
+async function fetchIpoFinancialsUnified(ipo) {
+  if (isNativeApkRuntime) {
+    if (typeof window.fetchNativeIpoFinancialsReport === "function") {
+      return window.fetchNativeIpoFinancialsReport(ipo.name, ipo.slug || "").catch(() => null);
+    }
+    return null;
+  }
+  const finUrl = `/api/hdipo/financials?name=${encodeURIComponent(ipo.name)}&slug=${encodeURIComponent(ipo.slug || "")}`;
+  const res = await fetch(finUrl).catch(() => null);
+  if (res && res.ok) {
+    return res.json().catch(() => null);
+  }
+  return null;
+}
+
 const prewarmInFlight = new Set();
 async function prewarmLiveIpoFinancials() {
   const candidates = remoteIPOs
@@ -1473,14 +1579,19 @@ async function prewarmLiveIpoFinancials() {
     const key = String(ipo.id);
     prewarmInFlight.add(key);
     try {
-      const finUrl = `/api/hdipo/financials?name=${encodeURIComponent(ipo.name)}&slug=${encodeURIComponent(ipo.slug || "")}`;
-      const res = await fetch(finUrl).catch(() => null);
-      if (res && res.ok) {
-        const finData = await res.json();
-        if (applyFinancialsReportToIpo(ipo, finData)) {
+      // Instant 0ms pre-bundled financials inside standalone APK if available
+      if (isNativeApkRuntime && typeof window.getBundledIpoFinancialsInstant === "function") {
+        const instantFin = window.getBundledIpoFinancialsInstant(ipo.name, ipo.slug || "");
+        if (instantFin && applyFinancialsReportToIpo(ipo, instantFin)) {
           runAutoAnalyst(ipo);
           anyUpdated = true;
+          return;
         }
+      }
+      const finData = await fetchIpoFinancialsUnified(ipo);
+      if (finData && applyFinancialsReportToIpo(ipo, finData)) {
+        runAutoAnalyst(ipo);
+        anyUpdated = true;
       }
     } catch (_) {
       // ignore background prewarm failure
@@ -1505,17 +1616,24 @@ async function openAnalysis(id) {
     window.hdAuth.logIpoAdvanceView(ipo.name, ipo.category).catch(() => {});
   }
 
+  // In standalone APK, immediately hydrate from pre-bundled 3-year financials if available (0ms load)
+  if (unlocked && !ipo.financialsLoaded && isNativeApkRuntime && typeof window.getBundledIpoFinancialsInstant === "function") {
+    const instantFin = window.getBundledIpoFinancialsInstant(ipo.name, ipo.slug || "");
+    if (instantFin && applyFinancialsReportToIpo(ipo, instantFin)) {
+      ipo = runAutoAnalyst(ipo);
+    }
+  }
+
   const needsFetch = unlocked && !ipo.financialsLoaded;
   drawModal(ipo, needsFetch);
 
   if (!needsFetch) return;
 
   try {
-    const finUrl = `/api/hdipo/financials?name=${encodeURIComponent(ipo.name)}&slug=${encodeURIComponent(ipo.slug || "")}`;
-    const [finRes, detRes, subRes] = await Promise.all([
-      fetch(finUrl).catch(() => null),
-      ipo.slug ? fetch(`https://ipos.markets/data/issue/${ipo.slug}.json?v=${Date.now()}`).catch(() => null) : Promise.resolve(null),
-      ipo.slug ? fetch(`https://ipos.markets/api/v1/subscription?symbol=${encodeURIComponent(ipo.slug)}`).catch(() => null) : Promise.resolve(null)
+    const [finData, detRes, subRes] = await Promise.all([
+      fetchIpoFinancialsUnified(ipo),
+      ipo.slug ? hdFetchText(`https://ipos.markets/data/issue/${ipo.slug}.json?v=${Date.now()}`).catch(() => null) : Promise.resolve(null),
+      ipo.slug ? hdFetchText(`https://ipos.markets/api/v1/subscription?symbol=${encodeURIComponent(ipo.slug)}`).catch(() => null) : Promise.resolve(null)
     ]);
 
     if (detRes && detRes.ok) {
@@ -1578,8 +1696,7 @@ async function openAnalysis(id) {
     }
 
     // Merge 3-4 Year RHP Financials, Ratios, Business Strengths & Deep Strength vs Demand Analysis
-    if (finRes && finRes.ok) {
-      const finData = await finRes.json();
+    if (finData && finData.found) {
       applyFinancialsReportToIpo(ipo, finData);
     }
 
@@ -1800,6 +1917,8 @@ function drawModal(ipo, isLoading) {
         ${ipo.rhpSourceUrl ? `<div style="margin-top:8px;text-align:right;"><a href="${escapeHtml(ipo.rhpSourceUrl)}" target="_blank" rel="noopener noreferrer" class="rhp-link">Official RHP / Detail Page ↗</a></div>` : ""}
       </div>
 
+      ${buildLotCalculatorHtml(ipo, safeId)}
+
       <div class="section-card post-card">
         <div class="section-heading">📈 Post-Listing Strategy (Data ke Hisab se)</div>
         <div class="kv-row"><span class="kv-label">Kitne Din Rakhna Hai?</span><span class="kv-val">${escapeHtml(ipo.postListing.holdingDays)}</span></div>
@@ -1902,6 +2021,100 @@ function analyzeLivePrice(id) {
   resBox.classList.remove("hidden");
 }
 
+function buildLotCalculatorHtml(ipo, safeId) {
+  const issuePrice = Number(ipo.issuePrice) || 0;
+  const lotSize = Number(ipo.lotSize) || 0;
+  if (issuePrice <= 0 || lotSize <= 1) return "";
+
+  const perLotAmt = Math.round(issuePrice * lotSize);
+  const gmpRs = Number(ipo.gmpRs) || 0;
+  const gmpPct = Number(ipo.gmpPct) || (issuePrice > 0 && gmpRs ? +((gmpRs / issuePrice) * 100).toFixed(1) : 0);
+  const isSme = ipo.category === "sme";
+  const maxRetailLots = isSme ? 1 : Math.max(1, Math.floor(200000 / perLotAmt));
+  const sHniLots = isSme ? 2 : Math.max(maxRetailLots + 1, Math.ceil(200001 / perLotAmt));
+  const bHniLots = isSme ? Math.max(3, Math.ceil(1000001 / perLotAmt)) : Math.max(sHniLots + 1, Math.ceil(1000001 / perLotAmt));
+
+  const initLots = 1;
+  const initShares = initLots * lotSize;
+  const initInvest = Math.round(initShares * issuePrice);
+  const initProfit = Math.round(initShares * gmpRs);
+  const profitColor = initProfit > 0 ? "#15803d" : (initProfit < 0 ? "#dc2626" : "#475569");
+  const profitText = gmpRs !== 0
+    ? `${initProfit > 0 ? "+" : ""}₹${initProfit.toLocaleString("en-IN")} (${gmpPct > 0 ? "+" : ""}${gmpPct}%)`
+    : "GMP Awaited";
+
+  return `
+    <div class="section-card lot-calc-card" id="lotCalcCard" data-price="${issuePrice}" data-lot="${lotSize}" data-gmp="${gmpRs}" data-lots="1">
+      <div class="section-heading" style="color:#1e3a8a;">🧮 Lot Size &amp; GMP Profit Calculator</div>
+      <div class="lot-preset-row">
+        <button type="button" class="lot-preset-btn active" onclick="setCalcLots(1, this)">1 Lot<br><small>Retail</small></button>
+        ${!isSme && maxRetailLots > 1 ? `<button type="button" class="lot-preset-btn" onclick="setCalcLots(${maxRetailLots}, this)">${maxRetailLots} Lots<br><small>Max Retail</small></button>` : ""}
+        <button type="button" class="lot-preset-btn" onclick="setCalcLots(${sHniLots}, this)">${sHniLots} Lots<br><small>${isSme ? "HNI Min" : "sHNI 2L+"}</small></button>
+        <button type="button" class="lot-preset-btn" onclick="setCalcLots(${bHniLots}, this)">${bHniLots} Lots<br><small>bHNI 10L+</small></button>
+      </div>
+      <div class="lot-stepper-row">
+        <span style="font-size:12px;font-weight:700;color:#334155;">Select Lots (${lotSize} Shares / Lot)</span>
+        <div class="lot-stepper-btns">
+          <button type="button" class="lot-step-btn" onclick="stepCalcLots(-1)">−</button>
+          <span id="lotCalcCount" class="lot-step-val">${initLots}</span>
+          <button type="button" class="lot-step-btn" onclick="stepCalcLots(1)">+</button>
+        </div>
+      </div>
+      <div class="lot-summary-grid">
+        <div class="lot-summary-box">
+          <small>Total Investment (<span id="lotCalcShares">${initShares.toLocaleString("en-IN")}</span> Shares)</small>
+          <strong id="lotCalcInvest">₹${initInvest.toLocaleString("en-IN")}</strong>
+        </div>
+        <div class="lot-summary-box">
+          <small>Est. Listing Profit (GMP ₹${gmpRs})</small>
+          <strong id="lotCalcProfit" style="color:${profitColor};">${profitText}</strong>
+        </div>
+      </div>
+    </div>
+  `;
+}
+
+function updateLotCalcDisplay(lots, activeBtn) {
+  const card = document.getElementById("lotCalcCard");
+  if (!card) return;
+  const cleanLots = Math.max(1, Math.min(500, Math.round(Number(lots) || 1)));
+  card.dataset.lots = String(cleanLots);
+  const issuePrice = Number(card.dataset.price) || 0;
+  const lotSize = Number(card.dataset.lot) || 1;
+  const gmpRs = Number(card.dataset.gmp) || 0;
+  const shares = cleanLots * lotSize;
+  const invest = Math.round(shares * issuePrice);
+  const profit = Math.round(shares * gmpRs);
+  const pct = issuePrice > 0 && gmpRs ? +((gmpRs / issuePrice) * 100).toFixed(1) : 0;
+
+  const cntEl = document.getElementById("lotCalcCount");
+  const shEl = document.getElementById("lotCalcShares");
+  const invEl = document.getElementById("lotCalcInvest");
+  const profEl = document.getElementById("lotCalcProfit");
+  if (cntEl) cntEl.textContent = String(cleanLots);
+  if (shEl) shEl.textContent = shares.toLocaleString("en-IN");
+  if (invEl) invEl.textContent = "₹" + invest.toLocaleString("en-IN");
+  if (profEl) {
+    profEl.style.color = profit > 0 ? "#15803d" : (profit < 0 ? "#dc2626" : "#475569");
+    profEl.textContent = gmpRs !== 0
+      ? `${profit > 0 ? "+" : ""}₹${profit.toLocaleString("en-IN")} (${pct > 0 ? "+" : ""}${pct}%)`
+      : "GMP Awaited";
+  }
+  card.querySelectorAll(".lot-preset-btn").forEach((b) => b.classList.remove("active"));
+  if (activeBtn) activeBtn.classList.add("active");
+}
+
+function setCalcLots(lots, btnEl) {
+  updateLotCalcDisplay(lots, btnEl || null);
+}
+
+function stepCalcLots(delta) {
+  const card = document.getElementById("lotCalcCard");
+  if (!card) return;
+  const cur = Number(card.dataset.lots) || 1;
+  updateLotCalcDisplay(cur + delta, null);
+}
+
 // EVENT LISTENERS (Search, Category Chips, Status Tabs, Bottom Navigation)
 if (searchInput) {
   searchInput.addEventListener("input", (e) => {
@@ -1944,13 +2157,13 @@ const popupOverlay = document.getElementById("hdPopupOverlay");
 const isStandaloneApp =
   window.matchMedia("(display-mode: standalone)").matches ||
   window.navigator.standalone === true ||
-  /HDIPOApp\//i.test(navigator.userAgent || "");
+  isNativeApkRuntime;
 const isIosDevice = /iphone|ipad|ipod/i.test(navigator.userAgent);
 const isAndroidDevice = /android/i.test(navigator.userAgent);
 const isInIframe = (() => { try { return window.self !== window.top; } catch (_) { return true; } })();
 
 const HD_VERSION_STORAGE_KEY = "hdUserAppVersion";
-let updatePopupShownThisSession = false;
+let lastPromptedUpdateVersion = "";
 let autoInstallPopupTriggered = false;
 
 if (installBtn && isStandaloneApp) {
@@ -1980,11 +2193,7 @@ function closePopupOverlay() {
   }
 }
 
-function getAppConfigSafe() {
-  return (window.hdAuth && window.hdAuth.appConfig)
-    ? window.hdAuth.appConfig
-    : { apkUrl: "", appVersion: "v1.0", updateNotes: "", loaded: false };
-}
+const BUNDLED_APK_VERSION = "v1.3";
 
 function normalizeVersionParts(ver) {
   const clean = String(ver || "1.0").trim().replace(/^v/i, "");
@@ -2005,7 +2214,38 @@ function compareAppVersions(vA, vB) {
   return 0;
 }
 
+let serverLocalApkInfo = { hasLocalApk: false, sizeBytes: 0, version: BUNDLED_APK_VERSION };
+
+function getAppConfigSafe() {
+  const raw = (window.hdAuth && window.hdAuth.appConfig)
+    ? window.hdAuth.appConfig
+    : { apkUrl: "", appVersion: BUNDLED_APK_VERSION, updateNotes: "", loaded: false };
+  let effectiveVer = raw.appVersion || BUNDLED_APK_VERSION;
+  if (isNativeApkRuntime && window.HdAndroid && typeof window.HdAndroid.getAppVersionName === "function") {
+    try {
+      const nv = String(window.HdAndroid.getAppVersionName() || "").trim();
+      if (nv) {
+        const normNv = /^v/i.test(nv) ? nv : "v" + nv;
+        if (compareAppVersions(normNv, effectiveVer) > 0) effectiveVer = normNv;
+      }
+    } catch (_) {}
+  } else if (serverLocalApkInfo.hasLocalApk && serverLocalApkInfo.version) {
+    if (compareAppVersions(serverLocalApkInfo.version, effectiveVer) > 0) {
+      effectiveVer = serverLocalApkInfo.version;
+    }
+  } else if (compareAppVersions(BUNDLED_APK_VERSION, effectiveVer) > 0) {
+    effectiveVer = BUNDLED_APK_VERSION;
+  }
+  return { ...raw, appVersion: effectiveVer };
+}
+
 function getLocalAppVersion(remoteVersion) {
+  if (isNativeApkRuntime && window.HdAndroid && typeof window.HdAndroid.getAppVersionName === "function") {
+    try {
+      const nativeVer = String(window.HdAndroid.getAppVersionName() || "").trim();
+      if (nativeVer) return /^v/i.test(nativeVer) ? nativeVer : "v" + nativeVer;
+    } catch (_) {}
+  }
   let savedVer = localStorage.getItem(HD_VERSION_STORAGE_KEY);
   if (savedVer) return savedVer;
   const hasPreviousData = Boolean(
@@ -2015,22 +2255,27 @@ function getLocalAppVersion(remoteVersion) {
     localStorage.getItem("hdCustomIPOs")
   );
   // Returning users who used earlier versions start from v1.0 so they receive new update prompts
-  savedVer = hasPreviousData ? "v1.0" : (remoteVersion || "v1.0");
+  savedVer = hasPreviousData ? "v1.0" : (remoteVersion || BUNDLED_APK_VERSION);
   try { localStorage.setItem(HD_VERSION_STORAGE_KEY, savedVer); } catch (_) {}
   return savedVer;
 }
 
-let serverLocalApkInfo = { hasLocalApk: false, sizeBytes: 0 };
-fetch("/api/hdipo/apk-status")
-  .then((r) => (r.ok ? r.json() : null))
-  .then((d) => {
-    if (d && d.hasLocalApk) {
-      serverLocalApkInfo = { hasLocalApk: true, sizeBytes: Number(d.sizeBytes || 0) };
-      if (currentPage === "home") renderIPOs();
-      refreshOpenDrawer();
-    }
-  })
-  .catch(() => {});
+if (!isNativeApkRuntime) {
+  fetch("/api/hdipo/apk-status")
+    .then((r) => (r.ok ? r.json() : null))
+    .then((d) => {
+      if (d && d.hasLocalApk) {
+        serverLocalApkInfo = {
+          hasLocalApk: true,
+          sizeBytes: Number(d.sizeBytes || 0),
+          version: String(d.version || BUNDLED_APK_VERSION),
+        };
+        if (currentPage === "home") renderIPOs();
+        refreshOpenDrawer();
+      }
+    })
+    .catch(() => {});
+}
 
 const isInAppWebView = /whatsapp|fban|fbav|instagram|line\/|; wv\)/i.test(navigator.userAgent || "");
 
@@ -2039,14 +2284,40 @@ function hasAnyApkAvailable(cfg) {
   return Boolean(serverLocalApkInfo.hasLocalApk || (c.apkUrl && /^https:\/\//i.test(c.apkUrl)));
 }
 
+const isAiStudioPreviewHost = /^ais-(dev|pre)-/i.test(window.location.hostname || "");
+
+function toPublicDirectApkUrl(rawUrl) {
+  const u = String(rawUrl || "").trim();
+  if (!/^https:\/\//i.test(u)) return "";
+  const driveFile = u.match(/drive\.google\.com\/file\/d\/([a-zA-Z0-9_-]+)/i);
+  if (driveFile && driveFile[1]) {
+    return `https://drive.usercontent.google.com/download?id=${driveFile[1]}&export=download&confirm=t`;
+  }
+  const driveOpen = u.match(/drive\.google\.com\/(?:open|uc)\?.*id=([a-zA-Z0-9_-]+)/i);
+  if (driveOpen && driveOpen[1]) {
+    return `https://drive.usercontent.google.com/download?id=${driveOpen[1]}&export=download&confirm=t`;
+  }
+  if (/dropbox\.com/i.test(u)) {
+    return u.replace(/[?&]dl=0/i, (m) => m.replace("0", "1"));
+  }
+  return u;
+}
+
 function getBaseApkDownloadUrl(cfg) {
   const c = cfg || getAppConfigSafe();
   const ver = encodeURIComponent(c.appVersion || "v1.0");
+  const publicExternalUrl = toPublicDirectApkUrl(c.apkUrl);
+  // On AI Studio preview domains (ais-dev/ais-pre), external Google Drive/GitHub link avoids cookie redirects on other phones
+  if (isAiStudioPreviewHost && publicExternalUrl) {
+    return publicExternalUrl;
+  }
   if (serverLocalApkInfo.hasLocalApk) {
     return `/api/download/base.apk?v=${ver}`;
   }
-  if (c.apkUrl && /^https:\/\//i.test(c.apkUrl)) {
-    return `/api/download/base.apk?url=${encodeURIComponent(c.apkUrl)}&v=${ver}`;
+  if (publicExternalUrl) {
+    return isAiStudioPreviewHost
+      ? publicExternalUrl
+      : `/api/download/base.apk?url=${encodeURIComponent(c.apkUrl)}&v=${ver}`;
   }
   return "";
 }
@@ -2056,24 +2327,25 @@ function getChromeIntentUrl() {
   if (/^https:\/\/ais-dev-/i.test(origin)) {
     origin = origin.replace(/^https:\/\/ais-dev-/i, "https://ais-pre-");
   }
-  const hostPath = origin.replace(/^https?:\/\//i, "") + "/?install=1";
+  const hostPath = origin.replace(/^https?:\/\//i, "") + "/";
   return `intent://${hostPath}#Intent;scheme=https;package=com.android.chrome;end`;
 }
 
 function startApkFileDownload(apkUrl, versionLabel) {
   const cfg = getAppConfigSafe();
   const ver = String(versionLabel || cfg.appVersion || "v1.0").replace(/[^a-zA-Z0-9._-]/g, "") || "v1.0";
-  const dlUrl = serverLocalApkInfo.hasLocalApk
-    ? `/api/download/base.apk?v=${encodeURIComponent(ver)}`
-    : (apkUrl && /^https:\/\//i.test(apkUrl)
-      ? `/api/download/base.apk?url=${encodeURIComponent(apkUrl)}&v=${encodeURIComponent(ver)}`
-      : "");
+  const dlUrl = getBaseApkDownloadUrl({ ...cfg, apkUrl: apkUrl || cfg.apkUrl, appVersion: ver });
   if (!dlUrl) return false;
 
-  // Same-origin attachment download triggers immediate 1-click base.apk download on Android Chrome
+  const isExternal = /^https?:\/\//i.test(dlUrl) && !dlUrl.startsWith(window.location.origin);
   const a = document.createElement("a");
   a.href = dlUrl;
-  a.setAttribute("download", `HD-IPO-${ver}-base.apk`);
+  if (isExternal) {
+    a.target = "_blank";
+    a.rel = "noopener noreferrer";
+  } else {
+    a.setAttribute("download", `HD-IPO-${ver}-base.apk`);
+  }
   document.body.appendChild(a);
   a.click();
   document.body.removeChild(a);
@@ -2124,7 +2396,7 @@ function openInstallPopup() {
     <div class="hd-popup-card">
       <button class="hd-popup-x" onclick="dismissInstallPopup()" aria-label="Close">✕</button>
       <div class="hd-popup-brand">
-        <img src="/pwa-192x192.png" alt="HD IPO" class="hd-popup-icon">
+        <img src="pwa-192x192.png" alt="HD IPO" class="hd-popup-icon">
         <div>
           <div class="hd-popup-badge">OFFICIAL APP • ${escapeHtml(versionLabel)}</div>
           <h3 class="hd-popup-title">Install HD IPO Live</h3>
@@ -2256,14 +2528,14 @@ function openUpdatePopup(isPreview = false) {
   if (!popupOverlay) return;
   const cfg = getAppConfigSafe();
   const remoteVer = cfg.appVersion || "v1.1";
-  const localVer = isPreview ? "v1.0" : (localStorage.getItem(HD_VERSION_STORAGE_KEY) || "v1.0");
+  const localVer = isPreview ? "v1.0" : getLocalAppVersion(remoteVer);
   const notes = (cfg.updateNotes || "").trim();
 
   popupOverlay.innerHTML = `
     <div class="hd-popup-card update-card">
       <button class="hd-popup-x" onclick="cancelUpdatePopup()" aria-label="Close">✕</button>
       <div class="hd-popup-brand">
-        <img src="/pwa-192x192.png" alt="HD IPO" class="hd-popup-icon">
+        <img src="pwa-192x192.png" alt="HD IPO" class="hd-popup-icon">
         <div>
           <div class="hd-popup-badge update-badge">${isPreview ? "PREVIEW • " : ""}UPDATE AVAILABLE</div>
           <h3 class="hd-popup-title">Update HD IPO Live</h3>
@@ -2289,7 +2561,7 @@ function openUpdatePopup(isPreview = false) {
 
       <div id="updatePopupStatus" class="hd-popup-status hidden"></div>
 
-      <button class="hd-popup-btn-primary" onclick="runAppUpdateNow(${isPreview ? "true" : "false"})">
+      <button id="popupUpdateNowBtn" class="hd-popup-btn-primary" onclick="runAppUpdateNow(${isPreview ? "true" : "false"})">
         Update Now
       </button>
 
@@ -2307,6 +2579,55 @@ function cancelUpdatePopup() {
   closePopupOverlay();
 }
 
+window.__hdApkUpdateProgress = function (pct, message, state) {
+  const statusEl = document.getElementById("updatePopupStatus");
+  const btn = document.getElementById("popupUpdateNowBtn");
+  const clamped = Math.max(0, Math.min(100, Number(pct) || 0));
+
+  if (statusEl) {
+    statusEl.classList.remove("hidden");
+    if (state === "downloading") {
+      statusEl.innerHTML = `
+        <div style="display:flex;justify-content:space-between;font-weight:700;margin-bottom:6px;">
+          <span>${escapeHtml(message || "Downloading update...")}</span>
+          <span>${clamped}%</span>
+        </div>
+        <div style="width:100%;height:7px;background:#dbeafe;border-radius:999px;overflow:hidden;">
+          <div style="width:${clamped}%;height:100%;background:#1d4ed8;border-radius:999px;transition:width 0.2s;"></div>
+        </div>
+      `;
+    } else if (state === "installing") {
+      statusEl.innerHTML = `
+        <b>Update Ready (100%)</b><br>
+        ${escapeHtml(message || "Installer khul gaya hai — Update / Install par tap karein.")}
+      `;
+    } else if (state === "fallback") {
+      statusEl.innerHTML = `
+        <b>Download Browser mein shuru hua</b><br>
+        ${escapeHtml(message || "File download complete hone par tap karke Update karein.")}
+      `;
+    } else {
+      statusEl.innerHTML = `
+        <b>Update Info</b><br>
+        ${escapeHtml(message || "Internet check karke dobara Update Now dabayein.")}
+      `;
+    }
+  }
+
+  if (btn) {
+    if (state === "downloading") {
+      btn.disabled = true;
+      btn.textContent = `Downloading ${clamped}%...`;
+    } else if (state === "installing") {
+      btn.disabled = false;
+      btn.textContent = "Install / Retry Update";
+    } else {
+      btn.disabled = false;
+      btn.textContent = "Update Now";
+    }
+  }
+};
+
 async function runAppUpdateNow(isPreview = false) {
   const cfg = getAppConfigSafe();
   const remoteVer = cfg.appVersion || "v1.0";
@@ -2316,6 +2637,21 @@ async function runAppUpdateNow(isPreview = false) {
   if (isPreview) {
     showNotice("Preview Mode: Users ko yahan se latest app update milega.");
     closePopupOverlay();
+    return;
+  }
+
+  // 1) Pure Standalone Mobile APK: Direct In-App Download (0% -> 100%) + Native Android Installer!
+  if (isNativeApkRuntime && window.HdAndroid && typeof window.HdAndroid.downloadAndInstallApk === "function") {
+    const directUrl = toPublicDirectApkUrl(cfg.apkUrl);
+    if (directUrl) {
+      window.__hdApkUpdateProgress(5, `Downloading HD IPO ${remoteVer}...`, "downloading");
+      window.HdAndroid.downloadAndInstallApk(directUrl, remoteVer);
+      return;
+    }
+    if (statusEl) {
+      statusEl.innerHTML = `<b>Update Link Missing</b><br>Owner ne abhi naya APK link publish nahi kiya hai.`;
+      statusEl.classList.remove("hidden");
+    }
     return;
   }
 
@@ -2354,9 +2690,12 @@ function checkStartupPopups() {
   const remoteVer = cfg.appVersion || "v1.0";
   const localVer = getLocalAppVersion(remoteVer);
 
-  // Show Update popup only if a newer appVersion has been published
-  if (cfg.loaded && compareAppVersions(remoteVer, localVer) > 0 && !updatePopupShownThisSession) {
-    updatePopupShownThisSession = true;
+  // Inside native APK, only prompt when a newer version AND direct download link are live
+  if (isNativeApkRuntime && !hasAnyApkAvailable(cfg)) return;
+
+  // Show Update popup whenever a newer appVersion has been published (even if user skipped an older version earlier)
+  if (cfg.loaded && compareAppVersions(remoteVer, localVer) > 0 && lastPromptedUpdateVersion !== remoteVer) {
+    lastPromptedUpdateVersion = remoteVer;
     openUpdatePopup(false);
   }
 }
@@ -2379,8 +2718,15 @@ function formatShortTime(ts) {
   return d.toLocaleString("en-IN", { day: "2-digit", month: "short", hour: "2-digit", minute: "2-digit" });
 }
 
+const PUBLIC_WEB_FALLBACK_URL = "https://ais-pre-kagvgilpqnpwpkaqi7qqki-273113077839.asia-northeast1.run.app";
+
 function getShareAppLink() {
-  let origin = window.location.origin;
+  let origin = window.location.origin || "";
+  if (!/^https?:\/\//i.test(origin)) {
+    const cfg = getAppConfigSafe();
+    if (cfg.apkUrl && /^https:\/\//i.test(cfg.apkUrl)) return cfg.apkUrl;
+    return PUBLIC_WEB_FALLBACK_URL;
+  }
   if (/^https:\/\/ais-dev-/i.test(origin)) {
     origin = origin.replace(/^https:\/\/ais-dev-/i, "https://ais-pre-");
   }
@@ -2397,11 +2743,11 @@ function buildSharePromoMessage() {
     `• 3–4 Year Financial Performance (Revenue, Profit, Net Worth & Debt)`,
     `• Company Strength vs Market Demand Analysis`,
     `• Shareholder Quota Details & Family PAN Allotment Checker`,
-    `• Live Subscription, Listing Price & Closing Price Updates`,
-    ``,
-    `Open HD IPO Live:`,
-    url
+    `• Live Subscription, Listing Price & Closing Price Updates`
   ];
+  if (url) {
+    lines.push(``, `Open HD IPO Live:`, url);
+  }
   return lines.join("\n");
 }
 
@@ -2417,7 +2763,7 @@ function openShareModal() {
     <div class="hd-popup-card">
       <button class="hd-popup-x" onclick="closePopupOverlay()" aria-label="Close">✕</button>
       <div class="hd-popup-brand">
-        <img src="/pwa-192x192.png" alt="HD IPO" class="hd-popup-icon">
+        <img src="pwa-192x192.png" alt="HD IPO" class="hd-popup-icon">
         <div>
           <div class="hd-popup-badge">SHARE HD IPO LIVE</div>
           <h3 class="hd-popup-title">Share with Family & Friends</h3>
@@ -2451,11 +2797,15 @@ function copyFullShareMessage() {
 function shareNativeDirect() {
   const url = getShareAppLink();
   const text = buildSharePromoMessage();
+  if (window.HdAndroid && typeof window.HdAndroid.shareText === "function") {
+    window.HdAndroid.shareText(text);
+    return;
+  }
   if (navigator.share) {
     navigator.share({
       title: "HD IPO Live — GMP, Financials & Allotment App",
       text,
-      url
+      url: /^https?:\/\//i.test(url) ? url : undefined
     }).catch(() => {
       copyFullShareMessage();
     });
@@ -2463,6 +2813,28 @@ function shareNativeDirect() {
     copyFullShareMessage();
   }
 }
+
+window.handleAndroidBackPress = function () {
+  if (popupOverlay && !popupOverlay.classList.contains("hidden")) {
+    closePopupOverlay();
+    return true;
+  }
+  if (sideDrawerOverlay && !sideDrawerOverlay.classList.contains("hidden")) {
+    closeSideDrawer();
+    return true;
+  }
+  if (analysisModal && !analysisModal.classList.contains("hidden")) {
+    closeAnalysis();
+    return true;
+  }
+  if (currentPage !== "home") {
+    currentPage = "home";
+    navItems.forEach((n) => n.classList.toggle("active", (n.dataset.page || "home") === "home"));
+    renderCurrentPage();
+    return true;
+  }
+  return false;
+};
 
 function shareAppWithFriends() {
   openShareModal();
@@ -2999,6 +3371,10 @@ async function handlePrivateOwnerUnlockTap() {
   ownerTapTimer = setTimeout(() => { ownerTapCounter = 0; }, 2200);
   if (ownerTapCounter < 5) return;
   ownerTapCounter = 0;
+  if (isNativeApkRuntime) {
+    showNotice("Owner Controls Web App (Chrome) mein Settings se open karein.");
+    return;
+  }
   if (!window.hdAuth) return;
   if (window.hdAuth.isAdmin()) {
     openSettingsModal();
@@ -3015,36 +3391,41 @@ async function handlePrivateOwnerUnlockTap() {
 
 function openSettingsModal() {
   const cfg = getAppConfigSafe();
-  const remoteVer = cfg.appVersion || "v1.0";
+  const publishedVer = (window.hdAuth && window.hdAuth.appConfig && window.hdAuth.appConfig.appVersion) || "v1.0";
+  const remoteVer = cfg.appVersion || BUNDLED_APK_VERSION;
   const localVer = getLocalAppVersion(remoteVer);
   const isOwner = Boolean(window.hdAuth && window.hdAuth.isAdmin());
+
+  const hasPublicAutoUpdateUrl = Boolean(cfg.apkUrl && /^https:\/\//i.test(cfg.apkUrl) && !/ais-(dev|pre)-/i.test(cfg.apkUrl));
+  const isLatestPublished = hasPublicAutoUpdateUrl && compareAppVersions(publishedVer, BUNDLED_APK_VERSION) >= 0;
+  const autoUpdateStatusHtml = isLatestPublished
+    ? `<div style="background:#dcfce7;border:1px solid #86efac;color:#166534;padding:8px 10px;border-radius:8px;font-size:11.5px;font-weight:700;margin-bottom:10px;">✅ Sabhi Phones Par Live: <b>${escapeHtml(publishedVer)}</b> — Automatic Update Popup ACTIVE hai!</div>`
+    : `<div style="background:#fef3c7;border:1px solid #fcd34d;color:#92400e;padding:8px 10px;border-radius:8px;font-size:11.5px;line-height:1.45;margin-bottom:10px;">⚠️ <b>Mobile Phones Par Live: ${escapeHtml(publishedVer)}</b> (Naya <b>${escapeHtml(BUNDLED_APK_VERSION)}</b> abhi push nahi hua)<br>1) Niche se <b>Download base.apk</b> karein<br>2) <b>Google Drive</b> ("Anyone with the link") ya <b>GitHub Release</b> par upload karein<br>3) Link paste karke <b>Save &amp; Push Update</b> dabayein — turant sabhi phones mein <b>${escapeHtml(BUNDLED_APK_VERSION)}</b> aa jayega!</div>`;
 
   const ownerPrivateSectionHtml = isOwner ? `
       <div class="section-card" style="background:#f8fafc;">
         <div class="section-heading">🔐 Owner Private Controls</div>
-        <p class="about-text" style="margin-bottom:10px;">
-          Sirf aapke (App Owner) ke liye — APK download, builder, ya Google Drive / GitHub link yahan se manage karein:
-        </p>
+        ${autoUpdateStatusHtml}
         <div style="display:flex;gap:8px;margin-bottom:10px;">
-          <button type="button" class="btn-primary-full" style="margin:0;flex:1;background:#15803d;" onclick="triggerOneClickBaseApk()">⬇️ Download base.apk</button>
+          <button type="button" class="btn-primary-full" style="margin:0;flex:1;background:#15803d;" onclick="triggerOneClickBaseApk()">⬇️ Download base.apk (${escapeHtml(BUNDLED_APK_VERSION)})</button>
           <button type="button" class="btn-primary-full" style="margin:0;flex:1;background:#0f172a;" onclick="openApkBuilderModal()">🛠️ APK Builder</button>
         </div>
 
         <div class="form-field">
-          <label>APK Download Link (Google Drive / GitHub)</label>
-          <input type="url" id="settingsApkUrl" value="${escapeHtml(cfg.apkUrl || "")}" placeholder="https://drive.google.com/file/d/...">
+          <label>Public Direct APK Link (Google Drive / GitHub Release)</label>
+          <input type="url" id="settingsApkUrl" value="${escapeHtml(cfg.apkUrl || "")}" placeholder="https://drive.google.com/file/d/... ya GitHub .apk URL">
         </div>
         <div class="form-grid">
           <div class="form-field">
-            <label>App Version</label>
-            <input type="text" id="settingsApkVer" value="${escapeHtml(remoteVer)}" placeholder="v1.1" maxlength="30">
+            <label>Version to Push (e.g. ${escapeHtml(BUNDLED_APK_VERSION)})</label>
+            <input type="text" id="settingsApkVer" value="${escapeHtml(remoteVer)}" placeholder="${escapeHtml(BUNDLED_APK_VERSION)}" maxlength="30">
           </div>
           <div class="form-field">
-            <label>Update Note</label>
-            <input type="text" id="settingsApkNotes" value="${escapeHtml(cfg.updateNotes || "")}" placeholder="New Live Updates" maxlength="240">
+            <label>Update Note (Kya Naya Hai)</label>
+            <input type="text" id="settingsApkNotes" value="${escapeHtml(cfg.updateNotes || "")}" placeholder="Lot Calculator, Pull-to-Refresh & Fast Live GMP" maxlength="240">
           </div>
         </div>
-        <button id="saveOwnerApkBtn" class="btn-primary-full" style="margin-top:0;background:#1d4ed8;" onclick="handleOwnerSettingsApkSave()">💾 Save APK Link & Version</button>
+        <button id="saveOwnerApkBtn" class="btn-primary-full" style="margin-top:0;background:#1d4ed8;" onclick="handleOwnerSettingsApkSave()">🚀 Save &amp; Push Update to All Phones</button>
       </div>
   ` : "";
 
@@ -3124,24 +3505,28 @@ function openSettingsModal() {
 async function handleOwnerSettingsApkSave() {
   if (!window.hdAuth) return showNotice("App config load ho raha hai, 2 second baad try karein.");
   const urlVal = (document.getElementById("settingsApkUrl")?.value || "").trim();
-  const verVal = (document.getElementById("settingsApkVer")?.value || "v1.0").trim();
+  const verVal = (document.getElementById("settingsApkVer")?.value || BUNDLED_APK_VERSION).trim();
   const notesVal = (document.getElementById("settingsApkNotes")?.value || "").trim();
   const btn = document.getElementById("saveOwnerApkBtn");
 
-  if (btn) { btn.disabled = true; btn.textContent = "⏳ Saving..."; }
+  if (!urlVal || !/^https:\/\/.+/i.test(urlVal)) {
+    return showNotice("⚠️ Pehle Google Drive ('Anyone with link') ya GitHub Release ka https:// APK link paste karein!");
+  }
+
+  if (btn) { btn.disabled = true; btn.textContent = "⏳ Pushing Update..."; }
   try {
     if (!window.hdAuth.isAdmin()) {
       const res = await window.hdAuth.signInWithGoogle();
       if (res.status === "cancelled" || !window.hdAuth.isAdmin()) {
-        if (btn) { btn.disabled = false; btn.textContent = "💾 Save APK Link & Version"; }
-        return showNotice("Sirf App Owner account se APK link save kar sakte hain.");
+        if (btn) { btn.disabled = false; btn.textContent = "🚀 Save & Push Update to All Phones"; }
+        return showNotice("Sirf App Owner account se APK update push kar sakte hain.");
       }
     }
     await window.hdAuth.saveAppConfig(urlVal, verVal, notesVal);
-    showNotice(`✅ Saved! Ab sabko 1-Click HD-IPO-${verVal}-base.apk download dikhega!`);
+    showNotice(`✅ ${verVal} Push Ho Gaya! Ab sabhi installed Mobile Apps mein turant Update Available (${verVal}) dikhega!`);
     openSettingsModal();
   } catch (err) {
-    if (btn) { btn.disabled = false; btn.textContent = "💾 Save APK Link & Version"; }
+    if (btn) { btn.disabled = false; btn.textContent = "🚀 Save & Push Update to All Phones"; }
     showNotice(err && err.message ? err.message : "APK link save karne mein error aayi.");
   }
 }
@@ -3374,6 +3759,113 @@ window.addEventListener("hd-auth-changed", () => {
   }
 });
 
+// ===== NATIVE ANDROID BACK BUTTON HANDLER (Never Exit Accidentally) =====
+let lastAndroidBackTapAt = 0;
+window.__hdHandleAndroidBack = function () {
+  if (popupOverlay && !popupOverlay.classList.contains("hidden")) {
+    closePopupOverlay();
+    return true;
+  }
+  if (sideDrawerOverlay && !sideDrawerOverlay.classList.contains("hidden")) {
+    closeSideDrawer();
+    return true;
+  }
+  if (analysisModal && !analysisModal.classList.contains("hidden")) {
+    closeAnalysis();
+    return true;
+  }
+  if (currentPage !== "home") {
+    currentPage = "home";
+    navItems.forEach((n) => n.classList.toggle("active", (n.dataset.page || "home") === "home"));
+    renderCurrentPage();
+    window.scrollTo({ top: 0, behavior: "smooth" });
+    return true;
+  }
+  if (currentSearch && searchInput) {
+    currentSearch = "";
+    searchInput.value = "";
+    renderCurrentPage();
+    return true;
+  }
+  const now = Date.now();
+  if (now - lastAndroidBackTapAt < 2000) {
+    return false; // Allow native Android exit on double-back
+  }
+  lastAndroidBackTapAt = now;
+  showNotice("Press Back again to exit HD IPO");
+  return true;
+};
+
+// ===== SMOOTH PULL-TO-REFRESH (Live GMP + App Update Check) =====
+(function setupPullToRefresh() {
+  let startY = 0;
+  let pulling = false;
+  let pullDist = 0;
+  let pill = null;
+
+  function ensurePill() {
+    if (!pill) {
+      pill = document.createElement("div");
+      pill.className = "hd-ptr-pill";
+      pill.textContent = "↓ Pull to refresh live GMP";
+      document.body.appendChild(pill);
+    }
+    return pill;
+  }
+
+  window.addEventListener("touchstart", (e) => {
+    if (!e.touches || e.touches.length !== 1) return;
+    if (window.scrollY > 4) return;
+    if (analysisModal && !analysisModal.classList.contains("hidden")) return;
+    if (sideDrawerOverlay && !sideDrawerOverlay.classList.contains("hidden")) return;
+    if (popupOverlay && !popupOverlay.classList.contains("hidden")) return;
+    startY = e.touches[0].clientY;
+    pulling = true;
+    pullDist = 0;
+  }, { passive: true });
+
+  window.addEventListener("touchmove", (e) => {
+    if (!pulling || !e.touches || e.touches.length !== 1) return;
+    const dy = e.touches[0].clientY - startY;
+    if (dy <= 10 || window.scrollY > 4) {
+      if (pill) pill.classList.remove("visible");
+      return;
+    }
+    pullDist = Math.min(110, dy);
+    const p = ensurePill();
+    p.classList.add("visible");
+    p.style.transform = `translate(-50%, ${Math.min(16, pullDist * 0.45 - 32)}px)`;
+    p.textContent = pullDist >= 68 ? "↻ Release to sync live data" : "↓ Pull to refresh live GMP";
+  }, { passive: true });
+
+  window.addEventListener("touchend", () => {
+    if (!pulling) return;
+    pulling = false;
+    const shouldRefresh = pullDist >= 68;
+    pullDist = 0;
+    if (shouldRefresh) {
+      const p = ensurePill();
+      p.classList.add("visible");
+      p.style.transform = "translate(-50%, 6px)";
+      p.textContent = "↻ Syncing live GMP & checking updates...";
+      Promise.all([
+        syncLiveData(true).catch(() => {}),
+        typeof window.hdCheckRemoteConfigNow === "function" ? window.hdCheckRemoteConfigNow().catch(() => {}) : Promise.resolve()
+      ]).finally(() => {
+        setTimeout(() => {
+          if (pill) {
+            pill.classList.remove("visible");
+            pill.style.transform = "translate(-50%, -60px)";
+          }
+        }, 500);
+      });
+    } else if (pill) {
+      pill.classList.remove("visible");
+      pill.style.transform = "translate(-50%, -60px)";
+    }
+  }, { passive: true });
+})();
+
 // APPLY SAVED DEFAULT CATEGORY & TAB CHIPS + INITIAL RENDER + AUTO LIVE SYNC
 if (Array.isArray(remoteIPOs) && remoteIPOs.length > 0) {
   remoteIPOs.forEach((item) => { try { runAutoAnalyst(item); } catch (_) {} });
@@ -3389,4 +3881,5 @@ if (window.hdAuth && window.hdAuth.appConfig && window.hdAuth.appConfig.loaded) 
   // Fallback if Firestore config takes longer than 2s (e.g., offline)
   setTimeout(() => { checkStartupPopups(); }, 2200);
 }
+
 

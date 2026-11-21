@@ -556,7 +556,7 @@ async function fetchInvestorGainGmpRows(): Promise<Record<string, unknown>[]> {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), 9000);
   try {
-    const res = await fetch('https://www.investorgain.com/report/live-ipo-gmp/331/', {
+    const res = await fetch('https://www.investorgain.com/report/ipo-gmp-live/331/', {
       signal: controller.signal,
       headers: {
         'User-Agent':
@@ -1007,19 +1007,21 @@ async function startServer() {
     }
   };
 
+  const HOSTED_APK_VERSION = 'v1.3';
+
   app.get('/api/hdipo/apk-status', (_req, res) => {
     const localApk = findLocalBaseApk();
     if (localApk) {
       const st = fs.statSync(localApk);
-      res.json({ ok: true, hasLocalApk: true, sizeBytes: st.size, fileName: 'base.apk' });
+      res.json({ ok: true, hasLocalApk: true, sizeBytes: st.size, fileName: 'base.apk', version: HOSTED_APK_VERSION });
       return;
     }
-    res.json({ ok: true, hasLocalApk: false, sizeBytes: 0, fileName: 'base.apk' });
+    res.json({ ok: true, hasLocalApk: false, sizeBytes: 0, fileName: 'base.apk', version: HOSTED_APK_VERSION });
   });
 
   const handleBaseApkDownload = async (req: express.Request, res: express.Response) => {
-    const rawVer = typeof req.query.v === 'string' ? req.query.v.trim() : 'v1.0';
-    const safeVer = rawVer.replace(/[^a-zA-Z0-9._-]/g, '').slice(0, 24) || 'v1.0';
+    const rawVer = typeof req.query.v === 'string' && req.query.v.trim() ? req.query.v.trim() : HOSTED_APK_VERSION;
+    const safeVer = rawVer.replace(/[^a-zA-Z0-9._-]/g, '').slice(0, 24) || HOSTED_APK_VERSION;
     const downloadFileName = `HD-IPO-${safeVer}-base.apk`;
 
     const localApk = findLocalBaseApk();
